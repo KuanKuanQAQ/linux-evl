@@ -649,7 +649,7 @@ static __always_inline void fpsimd_syscall_exit(void)
  */
 static void debug_exception_enter(struct pt_regs *regs)
 {
-	oob_trap_notify(ARM64_TRAP_DEBUG, regs);
+	mark_trap_entry(ARM64_TRAP_DEBUG, regs);
 
 	preempt_disable();
 
@@ -660,7 +660,7 @@ NOKPROBE_SYMBOL(debug_exception_enter);
 
 static void debug_exception_exit(struct pt_regs *regs)
 {
-	oob_trap_unwind(ARM64_TRAP_DEBUG, regs);
+	mark_trap_exit(ARM64_TRAP_DEBUG, regs);
 
 	preempt_enable_no_resched();
 }

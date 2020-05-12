@@ -20,6 +20,7 @@
 #include <linux/sched/signal.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/dovetail.h>
 
 #include <asm/cp15.h>
 #include <asm/system_info.h>
@@ -808,13 +809,15 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	u16 tinstr = 0;
 	int isize = 4;
 	int thumb2_32b = 0;
-	int fault;
+	int fault, ret = 0;
 
 	if (addr >= TASK_SIZE && user_mode(regs))
 		harden_branch_predictor();
 
 	if (interrupts_enabled(regs))
 		hard_local_irq_enable();
+
+	mark_trap_entry(ARM_TRAP_ALIGNMENT, regs);
 
 	instrptr = instruction_pointer(regs);
 
@@ -942,7 +945,7 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	if (thumb_mode(regs))
 		regs->ARM_cpsr = it_advance(regs->ARM_cpsr);
 
-	return 0;
+	goto out;
 
  bad_or_fault:
 	if (type == TYPE_ERROR)
@@ -951,7 +954,7 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	 * We got a fault - fix it up, or die.
 	 */
 	do_bad_area(addr, fsr, regs);
-	return 0;
+	goto out;
 
  swp:
 	pr_err("Alignment trap: not handling swp instruction\n");
@@ -965,7 +968,8 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 		isize << 1,
 		isize == 2 ? tinstr : instr, instrptr);
 	ai_skipped += 1;
-	return 1;
+	ret = 1;
+	goto out;
 
  user:
 	ai_user += 1;
@@ -1001,7 +1005,10 @@ do_alignment(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 			set_cr(cr_no_alignment);
 	}
 
-	return 0;
+out:
+	mark_trap_exit(ARM_TRAP_ALIGNMENT, regs);
+
+	return ret;
 }
 
 static int __init noalign_setup(char *__unused)

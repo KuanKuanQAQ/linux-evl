@@ -680,13 +680,14 @@ dotraplinkage void notrace do_int3(struct pt_regs *regs, long error_code)
 	flags = pipelined_fault_entry(X86_TRAP_BP, regs);
 
 	if (notify_die(DIE_INT3, "int3", regs, error_code, X86_TRAP_BP,
-			SIGTRAP) == NOTIFY_STOP)
-		goto exit_fault;
+			SIGTRAP) == NOTIFY_STOP) {
+		pipelined_fault_exit(X86_TRAP_BP, regs, flags);
+		goto exit;
+	}
 
 	cond_local_irq_enable(regs);
 	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, error_code, 0, NULL);
 	cond_local_irq_disable(regs);
-exit_fault:
 	pipelined_fault_exit(X86_TRAP_BP, regs, flags);
 
 exit:

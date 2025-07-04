@@ -71,7 +71,7 @@ static int __init __vdso_init(enum vdso_abi abi)
 	struct page **vdso_pagelist;
 	unsigned long pfn;
 	struct vdso_time_data *vdata = vdso_k_time_data;
-	struct vdso_clock *vc = vdata->clock_data;
+	struct vdso_clock *vc __maybe_unused = vdata->clock_data;
 
 	if (memcmp(vdso_info[abi].vdso_code_start, "\177ELF", 4)) {
 		pr_err("vDSO is not a valid ELF object!\n");

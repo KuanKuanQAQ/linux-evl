@@ -1219,8 +1219,8 @@ static void ipi_setup_lpi(int ipi, int ncpus)
 		 * be mapped, so that arm64_send_ipi() can read any IPI desc.
 		 */
 		if (irqs_pipelined())
-			for (i = ipi + 1; i < nr_ipi; i++)
-				get_ipi_desc(cpu, i) = irq_to_desc(irq);
+			for (i = OOB_IPI_OFFSET; i < OOB_NR_IPI + OOB_IPI_OFFSET; i++)
+				get_ipi_desc(cpu, i) = irq_to_desc(irq + i);
 	}
 }
 

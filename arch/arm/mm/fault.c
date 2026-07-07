@@ -225,18 +225,14 @@ void do_bad_area(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	 * If we are in kernel mode at this point, we
 	 * have no context to handle this fault with.
 	 */
-	  if (user_mode(regs)) {
-		irqflags = dovetail_fault_entry(ARM_TRAP_ACCESS, regs);
+	irqflags = dovetail_fault_entry(ARM_TRAP_ACCESS, regs);
+
+	if (user_mode(regs))
 		__do_user_fault(addr, fsr, SIGSEGV, SEGV_MAPERR, regs);
-		dovetail_fault_exit(ARM_TRAP_ACCESS, regs, irqflags);
-	  } else {
-		/*
-		 * irq_pipeline: kernel faults are either quickly
-		 * recoverable via fixup, or lethal. In both cases, we
-		 * can skip the interrupt state synchronization.
-		 */
+	else
 		__do_kernel_fault(mm, addr, fsr, regs);
-	  }
+
+	dovetail_fault_exit(ARM_TRAP_ACCESS, regs, irqflags);
 }
 
 #ifdef CONFIG_MMU

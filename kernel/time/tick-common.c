@@ -12,7 +12,9 @@
 #include <linux/err.h>
 #include <linux/hrtimer.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/nmi.h>
+#include <linux/irq.h>
 #include <linux/percpu.h>
 #include <linux/profile.h>
 #include <linux/sched.h>
@@ -242,6 +244,9 @@ static void tick_setup_device(struct tick_device *td,
 	 */
 	if (!cpumask_equal(newdev->cpumask, cpumask))
 		irq_set_affinity(newdev->irq, cpumask);
+
+	if (newdev->features & CLOCK_EVT_FEAT_PIPELINE)
+		irq_switch_tick(newdev->irq, true);
 
 	/*
 	 * When global broadcasting is active, check if the current

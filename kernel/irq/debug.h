@@ -35,6 +35,7 @@ static inline void print_irq_desc(unsigned int irq, struct irq_desc *desc)
 	___P(IRQ_NOAUTOEN);
 	___P(IRQ_OOB);
 	___P(IRQ_CHAINED);
+	___P(IRQ_TICK);
 
 	___PS(IRQS_AUTODETECT);
 	___PS(IRQS_REPLAY);

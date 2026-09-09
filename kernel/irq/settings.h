@@ -21,6 +21,7 @@ enum {
 	_IRQ_NO_DEBUG		= IRQ_NO_DEBUG,
 	_IRQ_OOB		= IRQ_OOB,
 	_IRQ_CHAINED		= IRQ_CHAINED,
+	_IRQ_TICK		= IRQ_TICK,
 	_IRQF_MODIFY_MASK	= IRQF_MODIFY_MASK,
 };
 
@@ -39,6 +40,7 @@ enum {
 #define IRQ_NO_DEBUG		GOT_YOU_MORON
 #define IRQ_OOB			GOT_YOU_MORON
 #define IRQ_CHAINED		GOT_YOU_MORON
+#define IRQ_TICK		GOT_YOU_MORON
 #undef IRQF_MODIFY_MASK
 #define IRQF_MODIFY_MASK	GOT_YOU_MORON
 
@@ -219,4 +221,19 @@ static inline void irq_settings_set_chained(struct irq_desc *desc)
 static inline void irq_settings_clr_chained(struct irq_desc *desc)
 {
 	desc->status_use_accessors &= ~_IRQ_CHAINED;
+}
+
+static inline bool irq_settings_is_tick(struct irq_desc *desc)
+{
+	return desc->status_use_accessors & _IRQ_TICK;
+}
+
+static inline void irq_settings_clr_tick(struct irq_desc *desc)
+{
+	desc->status_use_accessors &= ~_IRQ_TICK;
+}
+
+static inline void irq_settings_set_tick(struct irq_desc *desc)
+{
+	desc->status_use_accessors |= _IRQ_TICK;
 }

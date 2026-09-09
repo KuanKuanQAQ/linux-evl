@@ -987,6 +987,24 @@ out:
 }
 EXPORT_SYMBOL_GPL(irq_switch_oob);
 
+void irq_switch_tick(unsigned int irq, bool on)
+{
+	struct irq_desc *desc;
+	unsigned long flags;
+
+	desc = irq_get_desc_lock(irq, &flags, 0);
+
+	if (likely(desc)) {
+		if (on)
+			irq_settings_set_tick(desc);
+		else
+			irq_settings_clr_tick(desc);
+	}
+
+	irq_put_desc_unlock(desc, flags);
+}
+EXPORT_SYMBOL_GPL(irq_switch_tick);
+
 #endif /* CONFIG_IRQ_PIPELINE */
 
 /*

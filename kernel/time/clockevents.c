@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/smp.h>
+#include <linux/irq.h>
 #include <linux/device.h>
 
 #include "tick-internal.h"
@@ -173,6 +174,8 @@ void clockevents_shutdown(struct clock_event_device *dev)
 {
 	clockevents_switch_state(dev, CLOCK_EVT_STATE_SHUTDOWN);
 	dev->next_event = KTIME_MAX;
+	if (dev->features & CLOCK_EVT_FEAT_PIPELINE)
+		irq_switch_tick(dev->irq, false);
 }
 
 /**

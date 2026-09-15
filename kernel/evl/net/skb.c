@@ -726,8 +726,12 @@ struct sk_buff *evl_net_wget_skb(struct evl_socket *esk,
 		return skb;
 
 	ret = evl_net_charge_skb_wmem(esk, skb, timeout, tmode);
+	if (ret) {
+		evl_net_free_skb(skb);
+		return ERR_PTR(ret);
+	}
 
-	return ret ? ERR_PTR(ret) : skb;
+	return skb;
 }
 
 /*

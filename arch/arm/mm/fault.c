@@ -378,6 +378,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	unsigned int flags = FAULT_FLAG_DEFAULT;
 	unsigned long vm_flags = VM_ACCESS_FLAGS;
 	unsigned long irqflags;
+	int ret = 0;
 
 	irqflags = fault_entry(ARM_TRAP_ACCESS, regs);
 
@@ -388,8 +389,10 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
 	 * Handle kernel addresses faults separately, which avoids touching
 	 * the mmap lock from contexts that are not able to sleep.
 	 */
-	if (addr >= TASK_SIZE)
-		return do_kernel_address_page_fault(mm, addr, fsr, regs);
+	if (addr >= TASK_SIZE) {
+		ret = do_kernel_address_page_fault(mm, addr, fsr, regs);
+		goto out;
+	}
 
 	/* Enable interrupts if they were enabled in the parent context. */
 	if (interrupts_enabled(regs))

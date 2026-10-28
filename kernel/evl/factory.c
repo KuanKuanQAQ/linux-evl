@@ -28,6 +28,7 @@
 #include <linux/dovetail.h>
 #include <evl/assert.h>
 #include <evl/file.h>
+#include <evl/lkl.h>
 #include <evl/control.h>
 #include <evl/factory.h>
 #include <evl/uaccess.h>
@@ -73,7 +74,7 @@ int evl_init_element(struct evl_element *e,
 	int minor;
 
 	do {
-		minor = find_first_zero_bit(fac->minor_map, fac->nrdev);
+		minor = lkl_evl_find_first_zero_bit(fac->minor_map, fac->nrdev);
 		if (minor >= fac->nrdev) {
 			printk_ratelimited(EVL_WARNING "out of %ss",
 					fac->name);
@@ -465,12 +466,12 @@ static int create_element_device(struct evl_element *e,
 	 * device_register() won't trigger a kernel log splash because
 	 * of a naming conflict.
 	 */
-	hlen = hashlen_string("EVL", e->devname->name);
+	hlen = lkl_evl_hashlen_string("EVL", e->devname->name);
 
 	mutex_lock(&fac->hash_lock);
 
 	hash_for_each_possible(fac->name_hash, n, hash, hlen)
-		if (!strcmp(n->devname->name, e->devname->name)) {
+		if (!lkl_evl_strcmp(n->devname->name, e->devname->name)) {
 			mutex_unlock(&fac->hash_lock);
 			goto fail_hash;
 		}

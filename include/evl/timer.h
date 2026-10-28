@@ -17,6 +17,7 @@
 #include <evl/list.h>
 #include <evl/assert.h>
 #include <evl/timeout.h>
+#include <evl/lkl.h>
 
 /* Timer status */
 #define EVL_TIMER_DEQUEUED  0x00000001
@@ -66,7 +67,7 @@ static inline
 struct evl_tnode *evl_get_tqueue_next(struct evl_tqueue *tq,
 				struct evl_tnode *node)
 {
-	struct rb_node *_node = rb_next(&node->rb);
+	struct rb_node *_node = lkl_evl_rb_next(&node->rb);
 	return _node ? container_of(_node, struct evl_tnode, rb) : NULL;
 }
 
@@ -76,7 +77,7 @@ void evl_remove_tnode(struct evl_tqueue *tq, struct evl_tnode *node)
 	if (node == tq->head)
 		tq->head = evl_get_tqueue_next(tq, node);
 
-	rb_erase(&node->rb, &tq->root);
+	lkl_evl_rb_erase(&node->rb, &tq->root);
 }
 
 #define for_each_evl_tnode(__node, __tq)			\

@@ -17,6 +17,7 @@
 #include <evl/control.h>
 #include <evl/random.h>
 #include <evl/net.h>
+#include <evl/lkl.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/evl.h>
 
@@ -65,7 +66,7 @@ static void __init setup_init_state(void)
 	int n;
 
 	for (n = 0; n < ARRAY_SIZE(init_states); n++)
-		if (strcmp(init_states[n].label, init_state_arg) == 0) {
+		if (lkl_evl_strcmp(init_states[n].label, init_state_arg) == 0) {
 			set_evl_state(init_states[n].state);
 			return;
 		}

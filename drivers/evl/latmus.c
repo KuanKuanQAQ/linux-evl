@@ -20,6 +20,7 @@
 #include <evl/thread.h>
 #include <evl/xbuf.h>
 #include <evl/uaccess.h>
+#include <evl/lkl.h>
 #include <uapi/evl/devices/latmus-abi.h>
 #include <trace/events/evl.h>
 
@@ -672,7 +673,7 @@ static inline void build_score(struct latmus_runner *runner, int step)
 	n = state->cur_samples;
 	runner->scores[step].pmean = state->sum / n;
 	variance = n > 1 ? state->cur_sqs / (n - 1) : 0;
-	runner->scores[step].stddev = int_sqrt(variance);
+	runner->scores[step].stddev = lkl_evl_int_sqrt(variance);
 	runner->scores[step].minlat = state->min_lat;
 	runner->scores[step].gravity = runner->get_gravity(runner);
 	runner->scores[step].step = step;

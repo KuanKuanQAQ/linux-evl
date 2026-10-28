@@ -37,6 +37,7 @@
 #include <evl/control.h>
 #include <evl/uaccess.h>
 #include <evl/lock.h>
+#include <evl/lkl.h>
 #include <uapi/linux/sched/types.h>
 #include <trace/events/evl.h>
 
@@ -2614,7 +2615,7 @@ thread_factory_build(struct evl_factory *fac, const char __user *u_name,
 	 */
 	evl_get_element(&curr->element);
 
-	strncpy(comm, evl_element_name(&curr->element), sizeof(comm));
+	lkl_evl_strncpy(comm, evl_element_name(&curr->element), sizeof(comm));
 	comm[sizeof(comm) - 1] = '\0';
 	set_task_comm(tsk, comm);
 	proc_comm_connector(tsk);

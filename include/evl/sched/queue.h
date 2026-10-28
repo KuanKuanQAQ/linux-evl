@@ -10,6 +10,7 @@
 
 #include <linux/bitmap.h>
 #include <evl/list.h>
+#include <evl/lkl.h>
 
 /*
  * EVL core priority scale. We reserve a couple of additional priority
@@ -57,7 +58,7 @@ static __always_inline
 int evl_get_schedq_weight(struct evl_sched_queue *q)
 {
 	/* Highest priorities are mapped to lowest array elements. */
-	return find_first_bit(q->prio_map, EVL_MLQ_LEVELS);
+	return lkl_evl_find_first_bit(q->prio_map, EVL_MLQ_LEVELS);
 }
 
 static __always_inline

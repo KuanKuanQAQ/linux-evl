@@ -7,6 +7,7 @@
 #include <uapi/evl/types-abi.h>
 #include <evl/assert.h>
 #include <evl/map.h>
+#include <evl/lkl.h>
 
 /*
  * The largest value a fundle may have. This limit was picked to cover
@@ -46,7 +47,7 @@ static int map_node_at(struct evl_map *map,
 
 	n->fundle = fundle;
 	rb_link_node(&n->rb_node, parent, rbp);
-	rb_insert_color(&n->rb_node, &map->root);
+	lkl_evl_rb_insert_color(&n->rb_node, &map->root);
 
 	return 0;
 }
@@ -105,7 +106,7 @@ void evl_unmap_node(struct evl_map *map, struct evl_map_node *n)
 
 	if (n->fundle != EVL_NO_HANDLE) {
 		raw_spin_lock_irqsave(&map->lock, flags);
-		rb_erase(&n->rb_node, &map->root);
+		lkl_evl_rb_erase(&n->rb_node, &map->root);
 		raw_spin_unlock_irqrestore(&map->lock, flags);
 	}
 }

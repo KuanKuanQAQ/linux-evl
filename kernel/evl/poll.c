@@ -20,6 +20,7 @@
 #include <evl/mutex.h>
 #include <evl/lock.h>
 #include <evl/uaccess.h>
+#include <evl/lkl.h>
 
 struct poll_group {
 	struct rb_root item_index;  /* struct poll_item */
@@ -162,7 +163,7 @@ int index_item(struct rb_root *root, struct poll_item *item)
 	}
 
 	rb_link_node(&item->rb, parent, rbp);
-	rb_insert_color(&item->rb, root);
+	lkl_evl_rb_insert_color(&item->rb, root);
 
 	return 0;
 }
@@ -305,7 +306,7 @@ static int del_item(struct poll_group *group,
 		return -ENOENT;
 	}
 
-	rb_erase(&item->rb, &group->item_index);
+	lkl_evl_rb_erase(&item->rb, &group->item_index);
 	list_del(&item->next);
 	group->nr_items--;
 	new_generation(group);

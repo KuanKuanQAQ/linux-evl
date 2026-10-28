@@ -33,6 +33,7 @@
 #include <evl/file.h>
 #include <evl/irq.h>
 #include <evl/uaccess.h>
+#include <evl/lkl.h>
 #include <asm/evl/calibration.h>
 #include <trace/events/evl.h>
 
@@ -510,7 +511,7 @@ static int clock_sleep(struct evl_clock *clock,
 static void get_clock_resolution(struct evl_clock *clock,
 				struct timespec64 *res)
 {
-	*res = ktime_to_timespec64(evl_get_clock_resolution(clock));
+	*res = evl_ktime_to_timespec64(evl_get_clock_resolution(clock));
 
 	trace_evl_clock_getres(clock, res);
 }
@@ -518,7 +519,7 @@ static void get_clock_resolution(struct evl_clock *clock,
 static void get_clock_time(struct evl_clock *clock,
 			struct timespec64 *ts)
 {
-	*ts = ktime_to_timespec64(evl_read_clock(clock));
+	*ts = evl_ktime_to_timespec64(evl_read_clock(clock));
 
 	trace_evl_clock_gettime(clock, ts);
 }
@@ -534,14 +535,14 @@ static int set_clock_time(struct evl_clock *clock,
 static void get_timer_value(struct evl_timer *__restrict__ timer,
 			struct itimerspec64 *__restrict__ value)
 {
-	value->it_interval = ktime_to_timespec64(timer->interval);
+	value->it_interval = evl_ktime_to_timespec64(timer->interval);
 
 	if (!evl_timer_is_running(timer)) {
 		value->it_value.tv_sec = 0;
 		value->it_value.tv_nsec = 0;
 	} else
 		value->it_value =
-			ktime_to_timespec64(evl_get_timer_delta(timer));
+			evl_ktime_to_timespec64(evl_get_timer_delta(timer));
 }
 
 static int set_timer_value(struct evl_timer *__restrict__ timer,
@@ -982,10 +983,10 @@ static ssize_t gravity_store(struct device *dev,
 
 	gravity = clock->gravity;
 
-	while ((p = strsep(&args, " \t:/,")) != NULL) {
+	while ((p = lkl_evl_strsep(&args, " \t:/,")) != NULL) {
 		if (*p == '\0')
 			continue;
-		ns = simple_strtol(p, &p, 10);
+		ns = lkl_evl_simple_strtol(p, &p, 10);
 		switch (*p) {
 		case 'i':
 			gravity.irq = ns;

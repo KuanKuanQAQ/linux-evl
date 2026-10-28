@@ -24,4 +24,6 @@ evl-y :=		\
 	work.o		\
 	xbuf.o
 
+evl-y += lkl_host.o lkl_blob.o
+
 evl-$(CONFIG_FTRACE) +=	trace.o

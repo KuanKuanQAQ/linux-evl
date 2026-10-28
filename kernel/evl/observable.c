@@ -14,6 +14,7 @@
 #include <evl/clock.h>
 #include <evl/observable.h>
 #include <evl/factory.h>
+#include <evl/lkl.h>
 
 /* Co-exists with EVL_NOTIFY_MASK bits. */
 #define EVL_NOTIFY_INITIAL	(1 << 31)
@@ -75,7 +76,7 @@ int index_observer(struct rb_root *root, struct evl_observer *observer)
 	}
 
 	rb_link_node(&observer->rb, parent, rbp);
-	rb_insert_color(&observer->rb, root);
+	lkl_evl_rb_insert_color(&observer->rb, root);
 
 	return 0;
 }
@@ -294,7 +295,7 @@ static int cancel_subscription(struct evl_observable *observable) /* in-band */
 	 * caller exits afterwards.
 	 */
 	raw_spin_lock_irqsave(&sbr->lock, flags);
-	rb_erase(&observer->rb, &sbr->subscriptions);
+	lkl_evl_rb_erase(&observer->rb, &sbr->subscriptions);
 	raw_spin_unlock_irqrestore(&sbr->lock, flags);
 
 	/*
@@ -328,7 +329,7 @@ void evl_drop_subscriptions(struct evl_subscriber *sbr)
 
 	while ((rb = sbr->subscriptions.rb_node) != NULL) {
 		observer = rb_entry(rb, struct evl_observer, rb);
-		rb_erase(rb, &sbr->subscriptions);
+		lkl_evl_rb_erase(rb, &sbr->subscriptions);
 		/* Some subscriptions might be stale, check this. */
 		if (likely(!list_empty(&observer->next))) {
 			observable = evl_lookup_ns(&evl_core_ns, observer->fundle, observable);

@@ -14,6 +14,7 @@
 #include <linux/cpumask.h>
 #include <evl/list.h>
 #include <evl/factory.h>
+#include <evl/lkl.h>
 #include <uapi/evl/types-abi.h>
 #include <uapi/evl/clock-abi.h>
 
@@ -186,7 +187,7 @@ u_timespec_to_ktime(const struct __evl_timespec u_ts)
 static inline struct __evl_timespec
 ktime_to_u_timespec(ktime_t t)
 {
-	struct timespec64 ts64 = ktime_to_timespec64(t);
+	struct timespec64 ts64 = evl_ktime_to_timespec64(t);
 
 	return (struct __evl_timespec){
 		.tv_sec  = ts64.tv_sec,

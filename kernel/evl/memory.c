@@ -21,6 +21,7 @@
 #include <evl/monitor.h>
 #include <evl/assert.h>
 #include <evl/init.h>
+#include <evl/lkl.h>
 
 static unsigned long sysheap_size_arg;
 module_param_named(sysheap_size, sysheap_size_arg, ulong, 0444);
@@ -131,7 +132,7 @@ search_size_ge(struct rb_root *t, size_t size)
 		r = rb_entry(rb, struct evl_heap_range, size_node);
 		if (size <= r->size)
 			return r;
-		rb = rb_next(rb);
+		rb = lkl_evl_rb_next(rb);
 	}
 
 	return NULL;
@@ -190,7 +191,7 @@ static void insert_range_bysize(struct evl_heap *heap, struct evl_heap_range *r)
 	}
 
 	rb_link_node(&r->size_node, parent, new);
-	rb_insert_color(&r->size_node, &heap->size_tree);
+	lkl_evl_rb_insert_color(&r->size_node, &heap->size_tree);
 }
 
 static void insert_range_byaddr(struct evl_heap *heap, struct evl_heap_range *r)
@@ -208,7 +209,7 @@ static void insert_range_byaddr(struct evl_heap *heap, struct evl_heap_range *r)
 	}
 
 	rb_link_node(&r->addr_node, parent, new);
-	rb_insert_color(&r->addr_node, &heap->addr_tree);
+	lkl_evl_rb_insert_color(&r->addr_node, &heap->addr_tree);
 }
 
 static int reserve_page_range(struct evl_heap *heap, size_t size)
@@ -220,9 +221,9 @@ static int reserve_page_range(struct evl_heap *heap, size_t size)
 	if (new == NULL)
 		return -1;
 
-	rb_erase(&new->size_node, &heap->size_tree);
+	lkl_evl_rb_erase(&new->size_node, &heap->size_tree);
 	if (new->size == size) {
-		rb_erase(&new->addr_node, &heap->addr_tree);
+		lkl_evl_rb_erase(&new->addr_node, &heap->addr_tree);
 		return addr_to_pagenr(heap, new);
 	}
 
@@ -250,7 +251,7 @@ static void release_page_range(struct evl_heap *heap,
 
 	left = search_left_mergeable(heap, freed);
 	if (left) {
-		rb_erase(&left->size_node, &heap->size_tree);
+		lkl_evl_rb_erase(&left->size_node, &heap->size_tree);
 		left->size += freed->size;
 		freed = left;
 		addr_linked = true;
@@ -258,12 +259,12 @@ static void release_page_range(struct evl_heap *heap,
 
 	right = search_right_mergeable(heap, freed);
 	if (right) {
-		rb_erase(&right->size_node, &heap->size_tree);
+		lkl_evl_rb_erase(&right->size_node, &heap->size_tree);
 		freed->size += right->size;
 		if (addr_linked)
-			rb_erase(&right->addr_node, &heap->addr_tree);
+			lkl_evl_rb_erase(&right->addr_node, &heap->addr_tree);
 		else
-			rb_replace_node(&right->addr_node, &freed->addr_node,
+			lkl_evl_rb_replace_node(&right->addr_node, &freed->addr_node,
 					&heap->addr_tree);
 	} else if (!addr_linked)
 		insert_range_byaddr(heap, freed);

@@ -22,6 +22,7 @@
 #include <evl/monitor.h>
 #include <evl/sched.h>
 #include <evl/factory.h>
+#include <evl/lkl.h>
 #include <asm/syscall.h>
 #include <uapi/evl/syscall-abi.h>
 #include <asm/evl/syscall.h>
@@ -234,7 +235,7 @@ static bool handle_vdso_fallback(struct pt_regs *regs, unsigned int nr,
 	printk_once(EVL_WARNING "%s clock readout via fallback (no vDSO support)\n",
 		clock->name);
 
-	ts64 = ktime_to_timespec64(evl_read_clock(clock));
+	ts64 = evl_ktime_to_timespec64(evl_read_clock(clock));
 
 	if (is_clock_gettime(nr)) {
 		old_ts.tv_sec = (__kernel_old_time_t)ts64.tv_sec;

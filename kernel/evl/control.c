@@ -13,6 +13,7 @@
 #include <evl/tick.h>
 #include <evl/control.h>
 #include <evl/uaccess.h>
+#include <evl/lkl.h>
 #include <asm/evl/fptest.h>
 
 static BLOCKING_NOTIFIER_HEAD(state_notifier_list);
@@ -461,10 +462,10 @@ static ssize_t state_store(struct device *dev,
 	if (len && buf[len - 1] == '\n')
 		len--;
 
-	if (!strncmp(buf, "start", len))
+	if (!lkl_evl_strncmp(buf, "start", len))
 		return start_services() ?: count;
 
-	if (!strncmp(buf, "stop", len))
+	if (!lkl_evl_strncmp(buf, "stop", len))
 		return stop_services() ?: count;
 
 	return -EINVAL;

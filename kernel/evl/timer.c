@@ -9,6 +9,7 @@
 #include <evl/thread.h>
 #include <evl/timer.h>
 #include <evl/tick.h>
+#include <evl/lkl.h>
 #include <asm/div64.h>
 #include <trace/events/evl.h>
 
@@ -500,7 +501,7 @@ void evl_insert_tnode(struct evl_tqueue *tq, struct evl_tnode *node)
 		}
 
 	rb_link_node(&node->rb, parent, new);
-	rb_insert_color(&node->rb, &tq->root);
+	lkl_evl_rb_insert_color(&node->rb, &tq->root);
 }
 
 #endif

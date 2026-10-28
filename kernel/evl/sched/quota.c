@@ -9,6 +9,7 @@
 #include <asm/div64.h>
 #include <evl/sched.h>
 #include <evl/memory.h>
+#include <evl/lkl.h>
 #include <uapi/evl/sched-abi.h>
 
 /*
@@ -519,7 +520,7 @@ static int quota_create_group(struct evl_quota_group *tg,
 
 	assert_hard_lock(&rq->lock);
 
-	tgid = find_first_zero_bit(group_map, nr_groups);
+	tgid = lkl_evl_find_first_zero_bit(group_map, nr_groups);
 	if (tgid >= nr_groups)
 		return -EAGAIN;
 

@@ -2,14 +2,42 @@
  * SPDX-License-Identifier: GPL-2.0
  *
  * Copyright (C) 2018 Philippe Gerum  <rpm@xenomai.org>
+ *
+ * Cross-buffer between the oob stage (trusted side, "Z") and the
+ * in-band stage (untrusted side, "z"). See
+ * docs/22-pipe-final-design.md for the design.
+ *
+ * Two rings:
+ *   ibnd: oob_write()/evl_write_xbuf() -> read()      (Z produces)
+ *   obnd: write() -> oob_read()/evl_read_xbuf()       (Z consumes)
+ *
+ * Each ring is cut into three parts:
+ *   - struct xbuf_tend: state of the trusted end, written by trusted
+ *     code only, under the lock of its own EVL wait queue.
+ *   - struct xbuf_iend: state of the in-band end, written by in-band
+ *     code only, under an in-band spinlock. Trusted code never
+ *     touches it.
+ *   - struct xbuf_shared and bufmem: shared memory. Trusted code
+ *     publishes its fill count there, the in-band side may only read
+ *     it. Anything the trusted side reads from there is input: the
+ *     data bytes, and a "writer waiting" hint.
+ *
+ * In-band -> trusted: the in-band side reports how many bytes it
+ * transferred through xbuf_gate_commit(); the trusted side clamps
+ * the count against its own state then updates itself.
+ *
+ * Trusted -> in-band: the trusted side only records a notification
+ * (evl_inband_notify_post()); the in-band side wakes up its own
+ * waiters.
  */
 
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/poll.h>
-#include <linux/irq_work.h>
 #include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/uaccess.h>
 #include <linux/log2.h>
 #include <linux/atomic.h>
 #include <evl/thread.h>
@@ -17,46 +45,52 @@
 #include <evl/factory.h>
 #include <evl/sched.h>
 #include <evl/poll.h>
-#include <evl/flag.h>
+#include <evl/wait.h>
+#include <evl/clock.h>
+#include <evl/inband_notify.h>
 #include <uapi/evl/xbuf-abi.h>
 
+/* Shared memory: written by one side, read by the other one. */
+struct xbuf_shared {
+	atomic_t fill;		/* Z -> z: trusted fill count */
+	atomic_t oob_waiting;	/* Z -> z: oob callers sleeping */
+	atomic_t ib_waiting;	/* z -> Z: in-band callers sleeping, hint */
+};
+
+/* Trusted end: trusted code only, under wait.wchan.lock. */
+struct xbuf_tend {
+	struct evl_wait_queue wait;
+	unsigned int fill;	/* bytes readable by the consumer */
+	unsigned int off;	/* our own index: W or R */
+	unsigned int rsvd;	/* reserved by oob callers, in flight */
+	int pending;		/* reservations in flight */
+	int waiters;		/* oob callers sleeping on wait */
+	struct evl_inband_notify notify;
+};
+
+/* In-band end: in-band code only, under lock. */
+struct xbuf_iend {
+	spinlock_t lock;
+	unsigned int off;	/* our own index: W or R */
+	unsigned int rsvd;	/* reserved, transfer in flight */
+	unsigned int inflight;	/* transferred, being reported */
+	int pending;		/* reservations in flight */
+	wait_queue_head_t wait;
+};
+
 struct xbuf_ring {
-	void *bufmem;
-	size_t bufsz;
-	size_t fillsz;
-	unsigned int rdoff;
-	unsigned int rdrsvd;
-	int rdpending;
-	unsigned int wroff;
-	unsigned int wrrsvd;
-	int wrpending;
-	unsigned long (*lock)(struct xbuf_ring *ring);
-	void (*unlock)(struct xbuf_ring *ring, unsigned long flags);
-	int (*wait_input)(struct xbuf_ring *ring, size_t len, size_t avail);
-	void (*signal_input)(struct xbuf_ring *ring, bool sigpoll);
-	int (*wait_output)(struct xbuf_ring *ring, size_t len);
-	void (*signal_output)(struct xbuf_ring *ring, bool sigpoll);
-};
-
-struct xbuf_inbound {		/* oob_write->read */
-	struct wait_queue_head i_event;
-	struct evl_flag o_event;
-	struct irq_work irq_work;
-	struct xbuf_ring ring;
-	hard_spinlock_t lock;
-};
-
-struct xbuf_outbound {		/* write->oob_read */
-	struct evl_wait_queue i_event;
-	struct wait_queue_head o_event;
-	struct irq_work irq_work;
-	struct xbuf_ring ring;
+	void *bufmem;		/* shared, contents are input */
+	unsigned int bufsz;	/* immutable after creation */
+	bool oob_produces;
+	struct xbuf_tend t;
+	struct xbuf_shared *sh;
+	struct xbuf_iend *ib;
 };
 
 struct evl_xbuf {
 	struct evl_element element;
-	struct xbuf_inbound ibnd;
-	struct xbuf_outbound obnd;
+	struct xbuf_ring ibnd;	/* oob_write() -> read() */
+	struct xbuf_ring obnd;	/* write() -> oob_read() */
 	struct evl_poll_head poll_head;
 };
 
@@ -98,398 +132,238 @@ static int read_from_kernel(char *dst, struct xbuf_wdesc *src, size_t len)
 	return 0;
 }
 
-static ssize_t do_xbuf_read(struct xbuf_ring *ring,
+/* ================================================= trusted side */
+
+/* Trusted end locked. */
+static void tend_publish(struct xbuf_ring *ring)
+{
+	atomic_set_release(&ring->sh->fill, ring->t.fill);
+}
+
+/*
+ * Trusted end locked on entry and on return. Sleep until the in-band
+ * side reports some progress through the gate. A wake up is not a
+ * promise: callers re-evaluate their condition.
+ */
+static int tend_wait(struct xbuf_ring *ring, unsigned long *flags)
+{
+	struct xbuf_tend *t = &ring->t;
+	int ret;
+
+	t->waiters++;
+	atomic_set(&ring->sh->oob_waiting, t->waiters);
+	evl_add_wait_queue(&t->wait, EVL_INFINITE, EVL_REL);
+	raw_spin_unlock_irqrestore(&t->wait.wchan.lock, *flags);
+	ret = evl_wait_schedule(&t->wait);
+	raw_spin_lock_irqsave(&t->wait.wchan.lock, *flags);
+	t->waiters--;
+	atomic_set(&ring->sh->oob_waiting, t->waiters);
+
+	return ret;
+}
+
+/* Trusted consumer: obnd. */
+static ssize_t tend_read(struct xbuf_ring *ring,
 			struct xbuf_rdesc *rd, int f_flags)
 {
-	ssize_t len, ret, rbytes, n;
-	unsigned int rdoff, avail;
+	struct xbuf_tend *t = &ring->t;
+	unsigned int len, avail, off, n, rbytes;
 	unsigned long flags;
-	bool sigpoll;
+	ssize_t ret;
 	int xret;
 
-	len = rd->count;
-	if (len == 0)
+	if (rd->count == 0)
 		return 0;
 
 	if (ring->bufsz == 0)
 		return -ENOBUFS;
-retry:
+
+	len = min_t(size_t, rd->count, UINT_MAX);
 	rd->buf_ptr = rd->buf;
 
+	raw_spin_lock_irqsave(&t->wait.wchan.lock, flags);
+
 	for (;;) {
-		flags = ring->lock(ring);
+		avail = t->fill - t->rsvd;
+		if (avail >= len)
+			break;
+		if (f_flags & O_NONBLOCK) {
+			if (avail == 0) {
+				ret = -EAGAIN;
+				goto out;
+			}
+			len = avail;
+			break;
+		}
+		if (len > ring->bufsz) {
+			ret = -EINVAL;
+			goto out;
+		}
 		/*
-		 * We should be able to read a complete message of the
-		 * requested length if O_NONBLOCK is clear. If set and
-		 * some bytes are available, return them. Otherwise,
-		 * send -EAGAIN. The actual count of bytes available
-		 * for reading excludes the data which might be in
-		 * flight to userland as we drop the lock during copy.
+		 * An in-band writer short of space while we are short
+		 * of data: allow a short read instead of a deadlock.
+		 * The flag is input, any value is harmless.
 		 */
-		avail = ring->fillsz - ring->rdrsvd;
-		if (avail < len) {
-			if (f_flags & O_NONBLOCK) {
-				if (avail == 0) {
-					ret = -EAGAIN;
-					break;
-				}
-				len = avail;
-			} else {
-				if (len > ring->bufsz) {
-					ret = -EINVAL;
-					break;
-				}
-				ring->unlock(ring, flags);
-				ret = ring->wait_input(ring, len, avail);
-				if (unlikely(ret)) {
-					if (ret == -EAGAIN) {
-						len = avail;
-						goto retry;
-					}
-					return ret;
-				}
-				continue;
-			}
+		if (avail > 0 && atomic_read(&ring->sh->ib_waiting) > 0) {
+			len = avail;
+			break;
 		}
-
-		/* Reserve a read slot into the circular buffer. */
-		rdoff = ring->rdoff;
-		ring->rdoff = (rdoff + len) % ring->bufsz;
-		ring->rdpending++;
-		ring->rdrsvd += len;
-		rbytes = ret = len;
-
-		do {
-			if (rdoff + rbytes > ring->bufsz)
-				n = ring->bufsz - rdoff;
-			else
-				n = rbytes;
-
-			/*
-			 * Drop the lock before copying data to
-			 * user. The read slot is consumed in any
-			 * case: the non-copied portion of the message
-			 * is lost on bad write.
-			 */
-			ring->unlock(ring, flags);
-
-			xret = rd->xfer(rd, ring->bufmem + rdoff, n);
-			flags = ring->lock(ring);
-			if (xret) {
-				ret = -EFAULT;
-				break;
-			}
-
-			rd->buf_ptr += n;
-			rbytes -= n;
-			rdoff = (rdoff + n) % ring->bufsz;
-		} while (rbytes > 0);
-
-		if (--ring->rdpending == 0) {
-			/* sigpoll := full -> non-full transition. */
-			sigpoll = ring->fillsz == ring->bufsz;
-			ring->fillsz -= ring->rdrsvd;
-			ring->rdrsvd = 0;
-			ring->signal_output(ring, sigpoll);
-		}
-		break;
+		ret = tend_wait(ring, &flags);
+		if (ret)
+			goto out;
 	}
 
-	ring->unlock(ring, flags);
+	off = t->off;
+	t->off = (off + len) % ring->bufsz;
+	t->pending++;
+	t->rsvd += len;
+	rbytes = len;
+	ret = len;
+
+	do {
+		n = min(rbytes, ring->bufsz - off);
+		/* The slot is consumed in any case. */
+		raw_spin_unlock_irqrestore(&t->wait.wchan.lock, flags);
+		xret = rd->xfer(rd, ring->bufmem + off, n);
+		raw_spin_lock_irqsave(&t->wait.wchan.lock, flags);
+		if (xret) {
+			ret = -EFAULT;
+			break;
+		}
+		rd->buf_ptr += n;
+		rbytes -= n;
+		off = (off + n) % ring->bufsz;
+	} while (rbytes > 0);
+
+	if (--t->pending == 0) {
+		t->fill -= t->rsvd;
+		t->rsvd = 0;
+		tend_publish(ring);
+		/* Room for in-band writers: record only. */
+		evl_inband_notify_post(&t->notify);
+	}
+out:
+	raw_spin_unlock_irqrestore(&t->wait.wchan.lock, flags);
 
 	evl_schedule();
 
 	return ret;
 }
 
-static ssize_t do_xbuf_write(struct xbuf_ring *ring,
+/* Trusted producer: ibnd. */
+static ssize_t tend_write(struct xbuf_ring *ring,
 			struct xbuf_wdesc *wd, int f_flags)
 {
-	ssize_t len, ret, wbytes, n;
-	unsigned int wroff, avail;
+	struct xbuf_tend *t = &ring->t;
+	unsigned int len, off, n, wbytes;
 	unsigned long flags;
-	bool sigpoll;
+	ssize_t ret;
 	int xret;
 
-	len = wd->count;
-	if (len == 0)
+	if (wd->count == 0)
 		return 0;
 
 	if (ring->bufsz == 0)
 		return -ENOBUFS;
 
+	/* No short or scattered writes. */
+	if (wd->count > ring->bufsz)
+		return -EINVAL;
+
+	len = wd->count;
 	wd->buf_ptr = wd->buf;
 
+	raw_spin_lock_irqsave(&t->wait.wchan.lock, flags);
+
 	for (;;) {
-		flags = ring->lock(ring);
-		/*
-		 * No short or scattered writes: we should write the
-		 * entire message atomically or block.
-		 */
-		avail = ring->fillsz + ring->wrrsvd;
-		if (avail + len > ring->bufsz) {
-			ring->unlock(ring, flags);
-
-			if (f_flags & O_NONBLOCK)
-				return -EAGAIN;
-
-			ret = ring->wait_output(ring, len);
-			if (unlikely(ret))
-				return ret;
-
-			continue;
+		if (t->fill + t->rsvd + len <= ring->bufsz)
+			break;
+		if (f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
 		}
-
-		/* Reserve a write slot into the circular buffer. */
-		wroff = ring->wroff;
-		ring->wroff = (wroff + len) % ring->bufsz;
-		ring->wrpending++;
-		ring->wrrsvd += len;
-		wbytes = ret = len;
-
-		do {
-			if (wroff + wbytes > ring->bufsz)
-				n = ring->bufsz - wroff;
-			else
-				n = wbytes;
-
-			/*
-			 * We have to drop the lock while reading in
-			 * data, but we can't rollback on bad read
-			 * from user because some other thread might
-			 * have populated the memory ahead of our
-			 * write slot already: bluntly clear the
-			 * unavailable bytes on copy error.
-			 */
-			ring->unlock(ring, flags);
-			xret = wd->xfer(ring->bufmem + wroff, wd, n);
-			flags = ring->lock(ring);
-			if (xret) {
-				memset(ring->bufmem + wroff + n - xret, 0, xret);
-				ret = -EFAULT;
-				break;
-			}
-
-			wd->buf_ptr += n;
-			wbytes -= n;
-			wroff = (wroff + n) % ring->bufsz;
-		} while (wbytes > 0);
-
-		if (--ring->wrpending == 0) {
-			sigpoll = ring->fillsz == 0;
-			ring->fillsz += ring->wrrsvd;
-			ring->wrrsvd = 0;
-			ring->signal_input(ring, sigpoll);
-		}
-
-		ring->unlock(ring, flags);
-		break;
+		ret = tend_wait(ring, &flags);
+		if (ret)
+			goto out;
 	}
+
+	off = t->off;
+	t->off = (off + len) % ring->bufsz;
+	t->pending++;
+	t->rsvd += len;
+	wbytes = len;
+	ret = len;
+
+	do {
+		n = min(wbytes, ring->bufsz - off);
+		raw_spin_unlock_irqrestore(&t->wait.wchan.lock, flags);
+		xret = wd->xfer(ring->bufmem + off, wd, n);
+		raw_spin_lock_irqsave(&t->wait.wchan.lock, flags);
+		if (xret) {
+			/* Cannot roll back, clear what we failed to copy. */
+			memset(ring->bufmem + off + n - xret, 0, xret);
+			ret = -EFAULT;
+			break;
+		}
+		wd->buf_ptr += n;
+		wbytes -= n;
+		off = (off + n) % ring->bufsz;
+	} while (wbytes > 0);
+
+	if (--t->pending == 0) {
+		t->fill += t->rsvd;
+		t->rsvd = 0;
+		tend_publish(ring);
+		/* Data for in-band readers: record only. */
+		evl_inband_notify_post(&t->notify);
+	}
+out:
+	raw_spin_unlock_irqrestore(&t->wait.wchan.lock, flags);
 
 	evl_schedule();
 
 	return ret;
 }
 
-static unsigned long inbound_lock(struct xbuf_ring *ring)
+/*
+ * Gate, called by the in-band side: it reports @n bytes transferred
+ * on @ring, i.e. consumed from ibnd or produced into obnd. @n is
+ * input: it is clamped against the trusted state, which only trusted
+ * code updates. A lying peer can only make its own data wrong.
+ */
+static void xbuf_gate_commit(struct evl_xbuf *xbuf,
+			struct xbuf_ring *ring, unsigned int n)
 {
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
+	struct xbuf_tend *t = &ring->t;
 	unsigned long flags;
+	__poll_t events;
 
-	raw_spin_lock_irqsave(&xbuf->ibnd.lock, flags);
+	raw_spin_lock_irqsave(&t->wait.wchan.lock, flags);
 
-	return flags;
-}
-
-static void inbound_unlock(struct xbuf_ring *ring, unsigned long flags)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
-
-	raw_spin_unlock_irqrestore(&xbuf->ibnd.lock, flags);
-}
-
-static int inbound_wait_input(struct xbuf_ring *ring, size_t len, size_t avail)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
-	struct xbuf_inbound *ibnd = &xbuf->ibnd;
-	unsigned long flags;
-	bool o_blocked;
-
-	/*
-	 * Check whether writers are already waiting for sending data,
-	 * while we are about to wait for receiving some. In such a
-	 * case, we have a pathological use of the buffer due to a
-	 * miscalculated size. We must allow for a short read to
-	 * prevent a deadlock.
-	 */
-	if (avail > 0) {
-		evl_lock_flag(&ibnd->o_event, flags);
-		o_blocked = !!evl_wait_flag_head(&ibnd->o_event);
-		evl_unlock_flag(&ibnd->o_event, flags);
-		if (o_blocked)
-			return -EAGAIN;
+	if (ring->oob_produces) {
+		/* Never past what we published. */
+		n = min(n, t->fill);
+		t->fill -= n;
+		events = POLLOUT|POLLWRNORM;
+	} else {
+		/* Never over data oob readers have not released. */
+		n = min(n, ring->bufsz - t->fill);
+		t->fill += n;
+		events = POLLIN|POLLRDNORM;
 	}
 
-	return wait_event_interruptible(ibnd->i_event, ring->fillsz >= len);
-}
+	if (n > 0) {
+		tend_publish(ring);
+		if (t->waiters > 0)
+			evl_flush_wait_locked(&t->wait, 0);
+	}
 
-static void resume_inband_reader(struct irq_work *work)
-{
-	struct evl_xbuf *xbuf = container_of(work, struct evl_xbuf, ibnd.irq_work);
+	raw_spin_unlock_irqrestore(&t->wait.wchan.lock, flags);
 
-	wake_up(&xbuf->ibnd.i_event);
-}
+	if (n > 0)
+		evl_signal_poll_events(&xbuf->poll_head, events);
 
-/* ring locked, irqsoff */
-static void inbound_signal_input(struct xbuf_ring *ring, bool sigpoll)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
-
-	irq_work_queue(&xbuf->ibnd.irq_work);
-}
-
-static int inbound_wait_output(struct xbuf_ring *ring, size_t len)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
-
-	return evl_wait_flag(&xbuf->ibnd.o_event);
-}
-
-static void inbound_signal_output(struct xbuf_ring *ring, bool sigpoll)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, ibnd.ring);
-
-	if (sigpoll)
-		evl_signal_poll_events(&xbuf->poll_head, POLLOUT|POLLWRNORM);
-
-	evl_raise_flag_nosched(&xbuf->ibnd.o_event);
-}
-
-static ssize_t xbuf_read(struct file *filp, char __user *u_buf,
-			size_t count, loff_t *ppos)
-{
-	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
-	struct xbuf_rdesc rd = {
-		.buf = u_buf,
-		.count = count,
-		.xfer = write_to_user,
-	};
-
-	return do_xbuf_read(&xbuf->ibnd.ring, &rd, filp->f_flags);
-}
-
-static ssize_t xbuf_write(struct file *filp, const char __user *u_buf,
-			size_t count, loff_t *ppos)
-{
-	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
-	struct xbuf_wdesc wd = {
-		.buf = u_buf,
-		.count = count,
-		.xfer = read_from_user,
-	};
-
-	return do_xbuf_write(&xbuf->obnd.ring, &wd, filp->f_flags);
-}
-
-static long xbuf_ioctl(struct file *filp,
-		unsigned int cmd, unsigned long arg)
-{
-	return -ENOTTY;
-}
-
-static __poll_t xbuf_poll(struct file *filp, poll_table *wait)
-{
-	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
-	struct xbuf_outbound *obnd = &xbuf->obnd;
-	struct xbuf_inbound *ibnd = &xbuf->ibnd;
-	unsigned long flags;
-	__poll_t ready = 0;
-
-	poll_wait(filp, &ibnd->i_event, wait);
-	poll_wait(filp, &obnd->o_event, wait);
-
-	flags = ibnd->ring.lock(&ibnd->ring);
-
-	if (ibnd->ring.fillsz > 0)
-		ready |= POLLIN|POLLRDNORM;
-
-	ibnd->ring.unlock(&ibnd->ring, flags);
-
-	flags = obnd->ring.lock(&obnd->ring);
-
-	if (obnd->ring.fillsz < obnd->ring.bufsz)
-		ready |= POLLOUT|POLLWRNORM;
-
-	obnd->ring.unlock(&obnd->ring, flags);
-
-	return ready;
-}
-
-static long xbuf_oob_ioctl(struct file *filp,
-			unsigned int cmd, unsigned long arg)
-{
-	return -ENOTTY;
-}
-
-static unsigned long outbound_lock(struct xbuf_ring *ring)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-	unsigned long flags;
-
-	raw_spin_lock_irqsave(&xbuf->obnd.i_event.wchan.lock, flags);
-
-	return flags;
-}
-
-static void outbound_unlock(struct xbuf_ring *ring, unsigned long flags)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-
-	raw_spin_unlock_irqrestore(&xbuf->obnd.i_event.wchan.lock, flags);
-}
-
-static int outbound_wait_input(struct xbuf_ring *ring, size_t len, size_t avail)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-	struct xbuf_outbound *obnd = &xbuf->obnd;
-
-	if (avail > 0 && wq_has_sleeper(&obnd->o_event))
-		return -EAGAIN;
-
-	return evl_wait_event(&obnd->i_event, ring->fillsz >= len);
-}
-
-/* obnd.i_event locked, hard irqs off */
-static void outbound_signal_input(struct xbuf_ring *ring, bool sigpoll)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-
-	if (sigpoll)
-		evl_signal_poll_events(&xbuf->poll_head, POLLIN|POLLRDNORM);
-
-	evl_flush_wait_locked(&xbuf->obnd.i_event, 0);
-}
-
-static int outbound_wait_output(struct xbuf_ring *ring, size_t len)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-
-	return wait_event_interruptible(xbuf->obnd.o_event,
-					ring->fillsz + len <= ring->bufsz);
-}
-
-static void resume_inband_writer(struct irq_work *work)
-{
-	struct evl_xbuf *xbuf = container_of(work, struct evl_xbuf, obnd.irq_work);
-
-	wake_up(&xbuf->obnd.o_event);
-}
-
-static void outbound_signal_output(struct xbuf_ring *ring, bool sigpoll)
-{
-	struct evl_xbuf *xbuf = container_of(ring, struct evl_xbuf, obnd.ring);
-
-	irq_work_queue(&xbuf->obnd.irq_work);
+	evl_schedule();
 }
 
 static ssize_t xbuf_oob_read(struct file *filp,
@@ -502,7 +376,7 @@ static ssize_t xbuf_oob_read(struct file *filp,
 		.xfer = write_to_user,
 	};
 
-	return do_xbuf_read(&xbuf->obnd.ring, &rd, filp->f_flags);
+	return tend_read(&xbuf->obnd, &rd, filp->f_flags);
 }
 
 static ssize_t xbuf_oob_write(struct file *filp,
@@ -515,33 +389,243 @@ static ssize_t xbuf_oob_write(struct file *filp,
 		.xfer = read_from_user,
 	};
 
-	return do_xbuf_write(&xbuf->ibnd.ring, &wd, filp->f_flags);
+	return tend_write(&xbuf->ibnd, &wd, filp->f_flags);
+}
+
+static long xbuf_oob_ioctl(struct file *filp,
+			unsigned int cmd, unsigned long arg)
+{
+	return -ENOTTY;
 }
 
 static __poll_t xbuf_oob_poll(struct file *filp,
 			struct oob_poll_wait *wait)
 {
 	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
-	struct xbuf_outbound *obnd = &xbuf->obnd;
-	struct xbuf_inbound *ibnd = &xbuf->ibnd;
 	unsigned long flags;
 	__poll_t ready = 0;
 
 	evl_poll_watch(&xbuf->poll_head, wait, NULL);
 
-	flags = obnd->ring.lock(&obnd->ring);
+	raw_spin_lock_irqsave(&xbuf->obnd.t.wait.wchan.lock, flags);
+	if (xbuf->obnd.t.fill > 0)
+		ready |= POLLIN|POLLRDNORM;
+	raw_spin_unlock_irqrestore(&xbuf->obnd.t.wait.wchan.lock, flags);
 
-	if (obnd->ring.fillsz > 0)
+	raw_spin_lock_irqsave(&xbuf->ibnd.t.wait.wchan.lock, flags);
+	if (xbuf->ibnd.t.fill < xbuf->ibnd.bufsz)
+		ready |= POLLOUT|POLLWRNORM;
+	raw_spin_unlock_irqrestore(&xbuf->ibnd.t.wait.wchan.lock, flags);
+
+	return ready;
+}
+
+/* =================================================== in-band side */
+
+static unsigned int ib_published(struct xbuf_ring *ring)
+{
+	return (unsigned int)atomic_read_acquire(&ring->sh->fill);
+}
+
+/* Bytes the in-band reader of ibnd may still reserve. */
+static unsigned int ib_avail(struct xbuf_ring *ring)
+{
+	struct xbuf_iend *ib = ring->ib;
+	unsigned int fill = ib_published(ring);
+	unsigned int busy = READ_ONCE(ib->rsvd) + READ_ONCE(ib->inflight);
+
+	return fill > busy ? fill - busy : 0;
+}
+
+/* Bytes the in-band writer of obnd may still reserve. */
+static unsigned int ib_room(struct xbuf_ring *ring)
+{
+	struct xbuf_iend *ib = ring->ib;
+	unsigned int used = ib_published(ring) +
+		READ_ONCE(ib->rsvd) + READ_ONCE(ib->inflight);
+
+	return ring->bufsz > used ? ring->bufsz - used : 0;
+}
+
+/*
+ * The last in-flight transfer reports everything reserved so far.
+ * Reporting from the last one only keeps the oob side from seeing
+ * bytes another in-band transfer is still copying.
+ */
+static void ib_complete(struct evl_xbuf *xbuf, struct xbuf_ring *ring)
+{
+	struct xbuf_iend *ib = ring->ib;
+	unsigned int done = 0;
+
+	spin_lock(&ib->lock);
+	if (--ib->pending == 0) {
+		done = ib->rsvd;
+		ib->rsvd = 0;
+		ib->inflight += done;
+	}
+	spin_unlock(&ib->lock);
+
+	if (done) {
+		xbuf_gate_commit(xbuf, ring, done);
+		spin_lock(&ib->lock);
+		ib->inflight -= done;
+		spin_unlock(&ib->lock);
+	}
+}
+
+/* In-band consumer: ibnd. */
+static ssize_t xbuf_read(struct file *filp, char __user *u_buf,
+			size_t count, loff_t *ppos)
+{
+	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
+	struct xbuf_ring *ring = &xbuf->ibnd;
+	struct xbuf_iend *ib = ring->ib;
+	unsigned int len, avail, off, n, rbytes;
+	ssize_t ret;
+
+	if (count == 0)
+		return 0;
+
+	if (ring->bufsz == 0)
+		return -ENOBUFS;
+
+	len = min_t(size_t, count, UINT_MAX);
+
+	spin_lock(&ib->lock);
+
+	for (;;) {
+		avail = ib_avail(ring);
+		if (avail >= len)
+			break;
+		if (filp->f_flags & O_NONBLOCK) {
+			if (avail == 0) {
+				spin_unlock(&ib->lock);
+				return -EAGAIN;
+			}
+			len = avail;
+			break;
+		}
+		if (len > ring->bufsz) {
+			spin_unlock(&ib->lock);
+			return -EINVAL;
+		}
+		/* An oob writer short of space: short read. */
+		if (avail > 0 && atomic_read(&ring->sh->oob_waiting) > 0) {
+			len = avail;
+			break;
+		}
+		spin_unlock(&ib->lock);
+		ret = wait_event_interruptible(ib->wait, ib_avail(ring) >= len);
+		if (ret)
+			return ret;
+		spin_lock(&ib->lock);
+	}
+
+	off = ib->off;
+	ib->off = (off + len) % ring->bufsz;
+	ib->pending++;
+	ib->rsvd += len;
+	spin_unlock(&ib->lock);
+
+	rbytes = len;
+	ret = len;
+	do {
+		n = min(rbytes, ring->bufsz - off);
+		if (copy_to_user(u_buf, ring->bufmem + off, n)) {
+			ret = -EFAULT;
+			break;
+		}
+		u_buf += n;
+		rbytes -= n;
+		off = (off + n) % ring->bufsz;
+	} while (rbytes > 0);
+
+	ib_complete(xbuf, ring);
+
+	return ret;
+}
+
+/* In-band producer: obnd. */
+static ssize_t xbuf_write(struct file *filp, const char __user *u_buf,
+			size_t count, loff_t *ppos)
+{
+	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
+	struct xbuf_ring *ring = &xbuf->obnd;
+	struct xbuf_iend *ib = ring->ib;
+	unsigned int len, off, n, wbytes, left;
+	ssize_t ret;
+
+	if (count == 0)
+		return 0;
+
+	if (ring->bufsz == 0)
+		return -ENOBUFS;
+
+	/* No short or scattered writes. */
+	if (count > ring->bufsz)
+		return -EINVAL;
+
+	len = count;
+
+	spin_lock(&ib->lock);
+
+	while (ib_room(ring) < len) {
+		spin_unlock(&ib->lock);
+		if (filp->f_flags & O_NONBLOCK)
+			return -EAGAIN;
+		atomic_inc(&ring->sh->ib_waiting);
+		ret = wait_event_interruptible(ib->wait, ib_room(ring) >= len);
+		atomic_dec(&ring->sh->ib_waiting);
+		if (ret)
+			return ret;
+		spin_lock(&ib->lock);
+	}
+
+	off = ib->off;
+	ib->off = (off + len) % ring->bufsz;
+	ib->pending++;
+	ib->rsvd += len;
+	spin_unlock(&ib->lock);
+
+	wbytes = len;
+	ret = len;
+	do {
+		n = min(wbytes, ring->bufsz - off);
+		left = copy_from_user(ring->bufmem + off, u_buf, n);
+		if (left) {
+			memset(ring->bufmem + off + n - left, 0, left);
+			ret = -EFAULT;
+			break;
+		}
+		u_buf += n;
+		wbytes -= n;
+		off = (off + n) % ring->bufsz;
+	} while (wbytes > 0);
+
+	ib_complete(xbuf, ring);
+
+	return ret;
+}
+
+static long xbuf_ioctl(struct file *filp,
+		unsigned int cmd, unsigned long arg)
+{
+	return -ENOTTY;
+}
+
+static __poll_t xbuf_poll(struct file *filp, poll_table *wait)
+{
+	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
+	__poll_t ready = 0;
+
+	poll_wait(filp, &xbuf->ibnd.ib->wait, wait);
+	poll_wait(filp, &xbuf->obnd.ib->wait, wait);
+
+	if (ib_published(&xbuf->ibnd) > 0)
 		ready |= POLLIN|POLLRDNORM;
 
-	obnd->ring.unlock(&obnd->ring, flags);
-
-	flags = ibnd->ring.lock(&ibnd->ring);
-
-	if (ibnd->ring.fillsz < ibnd->ring.bufsz)
+	if (ib_published(&xbuf->obnd) < xbuf->obnd.bufsz)
 		ready |= POLLOUT|POLLWRNORM;
-
-	ibnd->ring.unlock(&ibnd->ring, flags);
 
 	return ready;
 }
@@ -550,8 +634,9 @@ static int xbuf_release(struct inode *inode, struct file *filp)
 {
 	struct evl_xbuf *xbuf = element_of(filp, struct evl_xbuf);
 
-	evl_flush_wait(&xbuf->obnd.i_event, EVL_T_RMID);
-	evl_flush_flag(&xbuf->ibnd.o_event, EVL_T_RMID);
+	/* Lifecycle is still driven in-band, see the design notes. */
+	evl_flush_wait(&xbuf->obnd.t.wait, EVL_T_RMID);
+	evl_flush_wait(&xbuf->ibnd.t.wait, EVL_T_RMID);
 
 	return evl_release_element(inode, filp);
 }
@@ -573,6 +658,8 @@ static const struct file_operations xbuf_fops = {
 #endif
 };
 
+/* ============================================== in-kernel interface */
+
 struct evl_xbuf *evl_get_xbuf(int efd, struct evl_file **efilpp)
 {
 	struct evl_file *efilp = evl_get_file(efd);
@@ -592,6 +679,11 @@ void evl_put_xbuf(struct evl_file *efilp)
 }
 EXPORT_SYMBOL_GPL(evl_put_xbuf);
 
+/*
+ * In-kernel callers use the trusted end, so they must run oob. In-band
+ * kernel code wanting to talk to the oob side should use the regular
+ * read/write file operations instead.
+ */
 ssize_t evl_read_xbuf(struct evl_xbuf *xbuf, void *buf,
 		size_t count, int f_flags)
 {
@@ -601,10 +693,13 @@ ssize_t evl_read_xbuf(struct evl_xbuf *xbuf, void *buf,
 		.xfer = write_to_kernel,
 	};
 
+	if (running_inband())
+		return -EPERM;
+
 	if (!(f_flags & O_NONBLOCK) && evl_cannot_block())
 		return -EPERM;
 
-	return do_xbuf_read(&xbuf->obnd.ring, &rd, f_flags);
+	return tend_read(&xbuf->obnd, &rd, f_flags);
 }
 EXPORT_SYMBOL_GPL(evl_read_xbuf);
 
@@ -617,18 +712,67 @@ ssize_t evl_write_xbuf(struct evl_xbuf *xbuf, const void *buf,
 		.xfer = read_from_kernel,
 	};
 
+	if (running_inband())
+		return -EPERM;
+
 	if (!(f_flags & O_NONBLOCK) && evl_cannot_block())
 		return -EPERM;
 
-	return do_xbuf_write(&xbuf->ibnd.ring, &wd, f_flags);
+	return tend_write(&xbuf->ibnd, &wd, f_flags);
 }
 EXPORT_SYMBOL_GPL(evl_write_xbuf);
+
+/* ======================================================== factory */
+
+static int init_ring(struct xbuf_ring *ring, size_t bufsz, bool oob_produces)
+{
+	ring->bufsz = bufsz;
+	ring->oob_produces = oob_produces;
+
+	if (bufsz > 0) {
+		ring->bufmem = kzalloc(bufsz, GFP_KERNEL);
+		if (ring->bufmem == NULL)
+			return -ENOMEM;
+	}
+
+	ring->sh = kzalloc(sizeof(*ring->sh), GFP_KERNEL);
+	if (ring->sh == NULL)
+		goto fail_sh;
+
+	ring->ib = kzalloc(sizeof(*ring->ib), GFP_KERNEL);
+	if (ring->ib == NULL)
+		goto fail_ib;
+
+	spin_lock_init(&ring->ib->lock);
+	init_waitqueue_head(&ring->ib->wait);
+	evl_init_wait(&ring->t.wait, &evl_mono_clock, EVL_WAIT_PRIO);
+	/* The in-band side waits on ib->wait in both directions. */
+	evl_init_inband_notify(&ring->t.notify, EVL_NOTIFY_WAKE_UP, 0,
+			&ring->ib->wait);
+
+	return 0;
+
+fail_ib:
+	kfree(ring->sh);
+fail_sh:
+	kfree(ring->bufmem);
+
+	return -ENOMEM;
+}
+
+static void destroy_ring(struct xbuf_ring *ring)
+{
+	evl_destroy_wait(&ring->t.wait);
+	evl_inband_notify_drain(&ring->t.notify);
+	kfree(ring->ib);
+	kfree(ring->sh);
+	kfree(ring->bufmem);
+}
 
 static struct evl_element *
 xbuf_factory_build(struct evl_factory *fac, const char __user *u_name,
 		void __user *u_attrs, int clone_flags, u32 *sstate_offp)
 {
-	void *i_bufmem = NULL, *o_bufmem = NULL;
 	struct evl_xbuf_attrs attrs;
 	struct evl_xbuf *xbuf;
 	int ret;
@@ -650,65 +794,30 @@ xbuf_factory_build(struct evl_factory *fac, const char __user *u_name,
 	if (xbuf == NULL)
 		return ERR_PTR(-ENOMEM);
 
-	if (attrs.i_bufsz > 0) {
-		i_bufmem = kzalloc(attrs.i_bufsz, GFP_KERNEL);
-		if (i_bufmem == NULL) {
-			ret = -ENOMEM;
-			goto fail_ibufmem;
-		}
-	}
+	/* Inbound traffic: oob_write() -> read(). */
+	ret = init_ring(&xbuf->ibnd, attrs.i_bufsz, true);
+	if (ret)
+		goto fail_ibnd;
 
-	if (attrs.o_bufsz > 0) {
-		o_bufmem = kzalloc(attrs.o_bufsz, GFP_KERNEL);
-		if (o_bufmem == NULL) {
-			ret = -ENOMEM;
-			goto fail_obufmem;
-		}
-	}
+	/* Outbound traffic: write() -> oob_read(). */
+	ret = init_ring(&xbuf->obnd, attrs.o_bufsz, false);
+	if (ret)
+		goto fail_obnd;
 
 	ret = evl_init_user_element(&xbuf->element, &evl_xbuf_factory,
 				u_name, clone_flags);
 	if (ret)
 		goto fail_element;
 
-	/* Inbound traffic: oob_write() -> read(). */
-	init_waitqueue_head(&xbuf->ibnd.i_event);
-	evl_init_flag(&xbuf->ibnd.o_event);
-	raw_spin_lock_init(&xbuf->ibnd.lock);
-	init_irq_work(&xbuf->ibnd.irq_work, resume_inband_reader);
-	xbuf->ibnd.ring.bufmem = i_bufmem;
-	xbuf->ibnd.ring.bufsz = attrs.i_bufsz;
-	xbuf->ibnd.ring.lock = inbound_lock;
-	xbuf->ibnd.ring.unlock = inbound_unlock;
-	xbuf->ibnd.ring.wait_input = inbound_wait_input;
-	xbuf->ibnd.ring.signal_input = inbound_signal_input;
-	xbuf->ibnd.ring.wait_output = inbound_wait_output;
-	xbuf->ibnd.ring.signal_output = inbound_signal_output;
-
-	/* Outbound traffic: write() -> oob_read(). */
-	evl_init_wait(&xbuf->obnd.i_event, &evl_mono_clock, EVL_WAIT_PRIO);
-	init_waitqueue_head(&xbuf->obnd.o_event);
-	init_irq_work(&xbuf->obnd.irq_work, resume_inband_writer);
-	xbuf->obnd.ring.bufmem = o_bufmem;
-	xbuf->obnd.ring.bufsz = attrs.o_bufsz;
-	xbuf->obnd.ring.lock = outbound_lock;
-	xbuf->obnd.ring.unlock = outbound_unlock;
-	xbuf->obnd.ring.wait_input = outbound_wait_input;
-	xbuf->obnd.ring.signal_input = outbound_signal_input;
-	xbuf->obnd.ring.wait_output = outbound_wait_output;
-	xbuf->obnd.ring.signal_output = outbound_signal_output;
-
 	evl_init_poll_head(&xbuf->poll_head);
 
 	return &xbuf->element;
 
 fail_element:
-	if (o_bufmem)
-		kfree(o_bufmem);
-fail_obufmem:
-	if (i_bufmem)
-		kfree(i_bufmem);
-fail_ibufmem:
+	destroy_ring(&xbuf->obnd);
+fail_obnd:
+	destroy_ring(&xbuf->ibnd);
+fail_ibnd:
 	kfree(xbuf);
 
 	return ERR_PTR(ret);
@@ -720,13 +829,9 @@ static void xbuf_factory_dispose(struct evl_element *e)
 
 	xbuf = container_of(e, struct evl_xbuf, element);
 
-	evl_destroy_wait(&xbuf->obnd.i_event);
-	evl_destroy_flag(&xbuf->ibnd.o_event);
+	destroy_ring(&xbuf->obnd);
+	destroy_ring(&xbuf->ibnd);
 	evl_destroy_element(&xbuf->element);
-	if (xbuf->ibnd.ring.bufmem)
-		kfree(xbuf->ibnd.ring.bufmem);
-	if (xbuf->obnd.ring.bufmem)
-		kfree(xbuf->obnd.ring.bufmem);
 	kfree_rcu(xbuf, element.rcu);
 }
 
@@ -741,11 +846,11 @@ static ssize_t rings_show(struct device *dev,
 	if (xbuf == NULL)
 		return -EIO;
 
-	ret = snprintf(buf, PAGE_SIZE, "%zu %zu %zu %zu\n",
-		xbuf->ibnd.ring.fillsz,
-		xbuf->ibnd.ring.bufsz,
-		xbuf->obnd.ring.fillsz,
-		xbuf->obnd.ring.bufsz);
+	ret = snprintf(buf, PAGE_SIZE, "%u %u %u %u\n",
+		READ_ONCE(xbuf->ibnd.t.fill),
+		xbuf->ibnd.bufsz,
+		READ_ONCE(xbuf->obnd.t.fill),
+		xbuf->obnd.bufsz);
 
 	evl_put_element(&xbuf->element);
 

@@ -484,12 +484,18 @@ static int clock_sleep(struct evl_clock *clock,
 	struct restart_block *restart;
 	ktime_t timeout, rem;
 
+	/*
+	 * The restart date is kept in the trusted thread (private
+	 * copy, doc 24): the in-band restart block may only tell
+	 * whether in-band code restarted something else meanwhile,
+	 * in which case we fail with -EINTR as before.
+	 */
 	if (curr->local_info & EVL_T_SYSRST) {
 		curr->local_info &= ~EVL_T_SYSRST;
 		restart = &current->restart_block;
 		if (restart->fn != restart_clock_sleep)
 			return -EINTR;
-		timeout = restart->nanosleep.expires;
+		timeout = curr->restart_expires;
 	} else
 		timeout = timespec64_to_ktime(ts64);
 
@@ -499,8 +505,8 @@ static int clock_sleep(struct evl_clock *clock,
 
 	if (signal_pending(current)) {
 		restart = &current->restart_block;
-		restart->nanosleep.expires = timeout;
 		restart->fn = restart_clock_sleep;
+		curr->restart_expires = timeout;
 		curr->local_info |= EVL_T_SYSRST;
 		return -ERESTARTSYS;
 	}

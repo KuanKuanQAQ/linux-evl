@@ -274,8 +274,16 @@ static int do_oob_syscall(struct irq_stage *stage, struct pt_regs *regs,
 		goto bad_syscall;
 	}
 
+	/*
+	 * Only attached threads may issue oob syscalls. The in-band
+	 * credentials are not read here: they are in-band state which
+	 * the in-band kernel may change at any time. The decision was
+	 * taken once by the attach gate, which raises CAP_SYS_NICE
+	 * for every attached thread (see evl_attach_self()), so being
+	 * attached is the trusted private copy of that check (doc 24).
+	 */
 	curr = evl_current();
-	if (curr == NULL || !cap_raised(current_cap(), CAP_SYS_NICE)) {
+	if (curr == NULL) {
 		if (EVL_DEBUG(CORE))
 			printk(EVL_WARNING
 				"syscall <oob_%s> denied to %s[%d]\n",

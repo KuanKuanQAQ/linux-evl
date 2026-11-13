@@ -155,6 +155,7 @@ struct evl_thread {
 	 */
 	struct evl_inband_notify inband_wakeup;
 	struct evl_inband_notify inband_signals;
+	ktime_t restart_expires;	/* clock_sleep() restart date */
 	struct {
 		struct evl_opt_counter isw;	/* in-band switches */
 		struct evl_opt_counter csw;	/* context switches */

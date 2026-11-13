@@ -151,9 +151,14 @@ static void pin_to_initial_cpu(struct evl_thread *thread)
 	 * task. If the current CPU is part of the affinity mask of
 	 * this thread, pin the latter on this CPU. Otherwise pin it
 	 * to the first CPU of that mask.
+	 *
+	 * z -> Z (doc 28): task_cpu() is read from the in-band task,
+	 * it is input. It is only a hint for picking a CPU, and it is
+	 * used as an index into trusted per-CPU data below, so bound
+	 * it before testing it against the trusted affinity mask.
 	 */
 	cpu = task_cpu(p);
-	if (!cpumask_test_cpu(cpu, &thread->affinity))
+	if (cpu >= nr_cpu_ids || !cpumask_test_cpu(cpu, &thread->affinity))
 		cpu = cpumask_first(&thread->affinity);
 
 	set_cpus_allowed_ptr(p, cpumask_of(cpu));
@@ -1494,17 +1499,22 @@ int evl_killall(int mask)
 		if ((t->state & EVL_T_ROOT) || (t->state & mask) != mask)
 			continue;
 
-		if (EVL_DEBUG(CORE))
-			printk(EVL_INFO "terminating %s[%d]\n",
-				t->name, evl_get_inband_pid(t));
-
 		evl_get_element(&t->element);
 		list_add(&t->kill_next, &kill_list);
 	}
 
 	raw_spin_unlock_irqrestore(&thread_list_lock, flags);
 
+	/*
+	 * doc 28: thread_list_lock is also taken from the oob stage
+	 * (map_kthread_self() -> enqueue_new_thread()), so in-band
+	 * code such as printk() does not run under it. We hold a
+	 * reference on each thread in kill_list.
+	 */
 	list_for_each_entry_safe(t, n, &kill_list, kill_next) {
+		if (EVL_DEBUG(CORE))
+			printk(EVL_INFO "terminating %s[%d]\n",
+				t->name, evl_get_inband_pid(t));
 		list_del(&t->kill_next);
 		nrkilled++;
 		evl_cancel_thread(t);
@@ -2672,6 +2682,131 @@ static void thread_factory_dispose(struct evl_element *e)
 		kfree_rcu(thread, element.rcu);
 }
 
+/*
+ * --------------------------------------------------------------
+ * sysfs: z -> Z gates (doc 28 §4.1)
+ *
+ * The *_show() handlers run in-band on behalf of any reader of
+ * /sys/devices/virtual/thread/<name>/, they are untrusted (z)
+ * code. They may read values the trusted side publishes, but they
+ * may not hold trusted locks, run trusted callbacks, or have
+ * trusted code write into their buffers. Each gate below takes the
+ * trusted lock, collects the values into trusted local storage,
+ * drops the lock, and only then copies the values out. The
+ * handlers format them.
+ */
+
+#define EVL_THREAD_SNAP_NAMELEN		256
+
+struct evl_thread_sched_snap {
+	int cpu, bprio, cprio;
+	char class_name[16];
+	char class_info[64];	/* empty if the class has nothing to show */
+};
+
+static void evl_thread_gate_sched(struct evl_thread *thread,
+				struct evl_thread_sched_snap *out)
+{
+	struct evl_thread_sched_snap s;
+	struct evl_sched_class *sched_class;
+	unsigned long flags;
+	ssize_t n;
+
+	s.class_info[0] = '\0';
+
+	raw_spin_lock_irqsave(&thread->lock, flags);
+
+	sched_class = thread->sched_class;
+	s.bprio = thread->bprio;
+	s.cprio = thread->cprio;
+	s.cpu = evl_rq_cpu(thread->rq);
+	lkl_evl_strncpy(s.class_name, sched_class->sched_name(thread),
+			sizeof(s.class_name));
+	/* The class writes into trusted storage, not into the reader's. */
+	if (sched_class->sched_show) {
+		n = sched_class->sched_show(thread, s.class_info,
+					sizeof(s.class_info));
+		if (n <= 0)
+			s.class_info[0] = '\0';
+	}
+
+	raw_spin_unlock_irqrestore(&thread->lock, flags);
+
+	s.class_name[sizeof(s.class_name) - 1] = '\0';
+	*out = s;
+}
+
+static void evl_thread_gate_wchan(struct evl_thread *thread,
+				char *out, size_t len)
+{
+	char name[EVL_THREAD_SNAP_NAMELEN];
+	struct evl_wait_channel *wchan;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&thread->lock, flags);
+	wchan = thread->wchan;
+	lkl_evl_strncpy(name, wchan ? wchan->name : "-", sizeof(name));
+	raw_spin_unlock_irqrestore(&thread->lock, flags);
+
+	name[sizeof(name) - 1] = '\0';
+	lkl_evl_strncpy(out, name, len);
+	out[len - 1] = '\0';
+}
+
+#ifdef CONFIG_EVL_RUNSTATS
+
+struct evl_thread_stats_snap {
+	u64 isw, csw, sc, rwa;
+	ktime_t total, exectime, account;
+};
+
+/*
+ * thread->stat.lastperiod only serves this gate: it remembers where
+ * the previous reading stopped, so that the next one reports the
+ * CPU usage since then. It is z-facing state kept in trusted memory,
+ * written by trusted code only, and no trusted decision depends on
+ * it.
+ */
+static void evl_thread_gate_stats(struct evl_thread *thread,
+				struct evl_thread_stats_snap *out)
+{
+	struct evl_thread_stats_snap s;
+	ktime_t period;
+	unsigned long flags;
+	struct evl_rq *rq;
+
+	raw_spin_lock_irqsave(&thread->lock, flags);
+
+	rq = evl_thread_rq(thread);
+
+	period = rq->last_account_switch - thread->stat.lastperiod.start;
+	if (period == 0 && thread == rq->curr) {
+		s.exectime = ktime_set(0, 1);
+		s.account = ktime_set(0, 1);
+	} else {
+		s.exectime = thread->stat.account.total -
+			thread->stat.lastperiod.total;
+		s.account = period;
+	}
+
+	s.total = thread->stat.account.total;
+	thread->stat.lastperiod.total = s.total;
+	thread->stat.lastperiod.start = rq->last_account_switch;
+
+	s.isw = evl_opt_counter_read(&thread->stat.isw);
+	s.csw = evl_opt_counter_read(&thread->stat.csw);
+	s.sc = evl_opt_counter_read(&thread->stat.sc);
+	s.rwa = evl_opt_counter_read(&thread->stat.rwa);
+
+	raw_spin_unlock_irqrestore(&thread->lock, flags);
+
+	*out = s;
+}
+
+#endif	/* CONFIG_EVL_RUNSTATS */
+
+/* -------------------------------------------- sysfs: z side */
+
 static ssize_t state_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
@@ -2683,7 +2818,8 @@ static ssize_t state_show(struct device *dev,
 	if (thread == NULL)
 		return -EIO;
 
-	ret = snprintf(buf, PAGE_SIZE, "%#x\n", thread->state);
+	/* A value the trusted side publishes, read as is. */
+	ret = snprintf(buf, PAGE_SIZE, "%#x\n", READ_ONCE(thread->state));
 
 	evl_put_element(&thread->element);
 
@@ -2695,40 +2831,24 @@ static ssize_t sched_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
 {
-	struct evl_sched_class *sched_class;
+	struct evl_thread_sched_snap s;
 	struct evl_thread *thread;
-	int bprio, cprio, cpu;
-	unsigned long flags;
-	ssize_t ret, _ret;
+	ssize_t ret;
 
 	thread = evl_get_element_by_dev(dev, struct evl_thread);
 	if (thread == NULL)
 		return -EIO;
 
-	raw_spin_lock_irqsave(&thread->lock, flags);
-
-	sched_class = thread->sched_class;
-	bprio = thread->bprio;
-	cprio = thread->cprio;
-	cpu = evl_rq_cpu(thread->rq);
+	evl_thread_gate_sched(thread, &s);
+	evl_put_element(&thread->element);
 
 	ret = snprintf(buf, PAGE_SIZE, "%d %d %d %s ",
-		cpu, bprio, cprio, sched_class->sched_name(thread));
+		s.cpu, s.bprio, s.cprio, s.class_name);
 
-	if (sched_class->sched_show) {
-		_ret = sched_class->sched_show(thread, buf + ret,
-					PAGE_SIZE - ret);
-		if (_ret > 0) {
-			ret += _ret;
-			goto out;
-		}
-	}
-
-	/* overwrites trailing whitespace */
-	buf[ret - 1] = '\n';
-out:
-	raw_spin_unlock_irqrestore(&thread->lock, flags);
-	evl_put_element(&thread->element);
+	if (s.class_info[0])
+		ret += snprintf(buf + ret, PAGE_SIZE - ret, "%s", s.class_info);
+	else
+		buf[ret - 1] = '\n'; /* overwrites trailing whitespace */
 
 	return ret;
 }
@@ -2740,36 +2860,20 @@ static ssize_t stats_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
 {
-	ktime_t period, exectime, account, total;
+	struct evl_thread_stats_snap s;
+	ktime_t exectime, account;
 	struct evl_thread *thread;
-	unsigned long flags;
-	struct evl_rq *rq;
-	ssize_t ret;
 	int usage;
 
 	thread = evl_get_element_by_dev(dev, struct evl_thread);
 	if (thread == NULL)
 		return -EIO;
 
-	raw_spin_lock_irqsave(&thread->lock, flags);
+	evl_thread_gate_stats(thread, &s);
+	evl_put_element(&thread->element);
 
-	rq = evl_thread_rq(thread);
-
-	period = rq->last_account_switch - thread->stat.lastperiod.start;
-	if (period == 0 && thread == rq->curr) {
-		exectime = ktime_set(0, 1);
-		account = ktime_set(0, 1);
-	} else {
-		exectime = thread->stat.account.total -
-			thread->stat.lastperiod.total;
-		account = period;
-	}
-
-	total = thread->stat.account.total;
-	thread->stat.lastperiod.total = total;
-	thread->stat.lastperiod.start = rq->last_account_switch;
-
-	raw_spin_unlock_irqrestore(&thread->lock, flags);
+	exectime = s.exectime;
+	account = s.account;
 
 	if (account) {
 		while (account > 0xffffffffUL) {
@@ -2784,17 +2888,8 @@ static ssize_t stats_show(struct device *dev,
 		usage = 0;
 	}
 
-	ret = snprintf(buf, PAGE_SIZE, "%Lu %Lu %Lu %Lu %Lu %d\n",
-		evl_opt_counter_read(&thread->stat.isw),
-		evl_opt_counter_read(&thread->stat.csw),
-		evl_opt_counter_read(&thread->stat.sc),
-		evl_opt_counter_read(&thread->stat.rwa),
-		total,
-		usage);
-
-	evl_put_element(&thread->element);
-
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%Lu %Lu %Lu %Lu %Lu %d\n",
+		s.isw, s.csw, s.sc, s.rwa, s.total, usage);
 }
 
 #else
@@ -2815,18 +2910,16 @@ static ssize_t timeout_show(struct device *dev,
 			char *buf)
 {
 	struct evl_thread *thread;
-	ssize_t ret;
+	ktime_t timeout;
 
 	thread = evl_get_element_by_dev(dev, struct evl_thread);
 	if (thread == NULL)
 		return -EIO;
 
-	ret = snprintf(buf, PAGE_SIZE, "%Lu\n",
-		ktime_to_ns(evl_get_thread_timeout(thread)));
-
+	timeout = evl_get_thread_timeout(thread); /* returns a value */
 	evl_put_element(&thread->element);
 
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%Lu\n", ktime_to_ns(timeout));
 }
 static DEVICE_ATTR_RO(timeout);
 
@@ -2835,17 +2928,16 @@ static ssize_t pid_show(struct device *dev,
 			char *buf)
 {
 	struct evl_thread *thread;
-	ssize_t ret;
+	pid_t pid;
 
 	thread = evl_get_element_by_dev(dev, struct evl_thread);
 	if (thread == NULL)
 		return -EIO;
 
-	ret = snprintf(buf, PAGE_SIZE, "%d\n", evl_get_inband_pid(thread));
-
+	pid = evl_get_inband_pid(thread);
 	evl_put_element(&thread->element);
 
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%d\n", pid);
 }
 static DEVICE_ATTR_RO(pid);
 
@@ -2854,18 +2946,16 @@ static ssize_t observable_show(struct device *dev,
 			char *buf)
 {
 	struct evl_thread *thread;
-	ssize_t ret;
+	bool observable;
 
 	thread = evl_get_element_by_dev(dev, struct evl_thread);
 	if (thread == NULL)
 		return -EIO;
 
-	ret = snprintf(buf, PAGE_SIZE, "%d\n",
-		evl_element_is_observable(&thread->element));
-
+	observable = evl_element_is_observable(&thread->element);
 	evl_put_element(&thread->element);
 
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%d\n", observable);
 }
 static DEVICE_ATTR_RO(observable);
 
@@ -2873,10 +2963,8 @@ static ssize_t wchan_show(struct device *dev,
 			struct device_attribute *attr,
 			char *buf)
 {
-	struct evl_wait_channel *wchan;
+	char name[EVL_THREAD_SNAP_NAMELEN];
 	struct evl_thread *thread;
-	unsigned long flags;
-	ssize_t ret;
 
 	/*
 	 * Reading the wait channel is a sensitive operation:
@@ -2891,14 +2979,10 @@ static ssize_t wchan_show(struct device *dev,
 	if (thread == NULL)
 		return -EIO;
 
-	raw_spin_lock_irqsave(&thread->lock, flags);
-	wchan = thread->wchan;
-	ret = snprintf(buf, PAGE_SIZE, "%s\n", wchan ? wchan->name : "-");
-	raw_spin_unlock_irqrestore(&thread->lock, flags);
-
+	evl_thread_gate_wchan(thread, name, sizeof(name));
 	evl_put_element(&thread->element);
 
-	return ret;
+	return snprintf(buf, PAGE_SIZE, "%s\n", name);
 }
 static DEVICE_ATTR_RO(wchan);
 

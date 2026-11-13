@@ -824,6 +824,9 @@ static long clock_common_ioctl(struct evl_clock *clock,
 				sizeof(uts)) ? -EFAULT : 0;
 		break;
 	case EVL_CLKIOC_SET_TIME:
+		/* doc 30: moves every absolute EVL timeout. */
+		if (!evl_may_control())
+			return -EPERM;
 		u_uts = (typeof(u_uts))arg;
 		ret = raw_copy_from_user(&uts, u_uts, sizeof(uts));
 		if (ret)
@@ -982,6 +985,10 @@ static ssize_t gravity_store(struct device *dev,
 
 	if (!*buf)
 		return 0;
+
+	/* doc 30: the gravity shifts every EVL timer. */
+	if (!evl_may_control())
+		return -EPERM;
 
 	dups = args = kstrdup(buf, GFP_KERNEL);
 

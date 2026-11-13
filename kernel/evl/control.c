@@ -12,6 +12,7 @@
 #include <evl/factory.h>
 #include <evl/tick.h>
 #include <evl/control.h>
+#include <evl/thread.h>
 #include <evl/uaccess.h>
 #include <evl/lkl.h>
 #include <asm/evl/fptest.h>
@@ -78,6 +79,19 @@ static int stop_services(void)
 	case EVL_STATE_STOPPED:
 		break;
 	case EVL_STATE_RUNNING:
+		/*
+		 * doc 30: stopping the core must not cancel running
+		 * EVL user threads on behalf of an in-band request.
+		 * New user threads cannot be created anymore in the
+		 * TEARDOWN state (ioctl_clone_device()), so this check
+		 * is final except for a clone request which passed
+		 * evl_is_running() just before: evl_killall() below
+		 * still reaps it.
+		 */
+		if (evl_count_threads(EVL_T_USER) > 0) {
+			set_evl_state(state);
+			return -EBUSY;
+		}
 		ret = evl_killall(EVL_T_USER);
 		if (ret) {
 			set_evl_state(state);
@@ -158,6 +172,10 @@ static int do_quota_control(const struct evl_sched_ctlreq *ctl)
 	if (ret)
 		return -EFAULT;
 
+	/* doc 30: only EVL threads may change the quota groups. */
+	if (param.quota.op != evl_quota_get && !evl_may_control())
+		return -EPERM;
+
 	ret = evl_sched_quota.sched_control(ctl->cpu, &param, &info);
 	if (ret < 0)
 		return ret;
@@ -196,6 +214,10 @@ static int do_tp_control(const struct evl_sched_ctlreq *ctl)
 	ret = raw_copy_from_user(&_param.tp, &u_ctlp->tp, sizeof(_param.tp));
 	if (ret)
 		return -EFAULT;
+
+	/* doc 30: only EVL threads may change the TP schedule. */
+	if (_param.tp.op != evl_tp_get && !evl_may_control())
+		return -EPERM;
 
 	/* Check now to prevent creepy memalloc down the road. */
 	if ((_param.tp.op == evl_tp_install || _param.tp.op == evl_tp_get) &&
@@ -505,6 +527,10 @@ static ssize_t quota_period_store(struct device *dev,
 {
 	unsigned long long period;
 	int ret;
+
+	/* doc 30: only EVL threads may change the quota period. */
+	if (!evl_may_control())
+		return -EPERM;
 
 	ret = kstrtoull(buf, 10, &period);
 	if (ret < 0)

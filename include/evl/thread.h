@@ -237,6 +237,25 @@ static __always_inline struct evl_thread *evl_current(void)
 	return dovetail_current_state()->thread;
 }
 
+/*
+ * evl_may_control - may the caller change how EVL threads run?
+ *
+ * Security assumption (doc 30): every EVL thread is trusted, a task
+ * which is not attached to the EVL core is not. EVL threads may
+ * control each other; any other caller may only query. This applies
+ * to every request which changes the scheduling, timing or lifetime
+ * of EVL threads, whatever the interface (in-band ioctl, sysfs).
+ * Requests coming through oob_ioctl() always pass, since only EVL
+ * threads can issue them.
+ *
+ * evl_current() comes from the Dovetail per-task oob state, which
+ * only the EVL core writes (trust base).
+ */
+static __always_inline bool evl_may_control(void)
+{
+	return evl_current() != NULL;
+}
+
 static __always_inline
 struct evl_rq *evl_thread_rq(struct evl_thread *thread)
 {
@@ -341,6 +360,8 @@ int evl_set_thread_schedparam(struct evl_thread *thread,
 			const union evl_sched_param *sched_param);
 
 int evl_killall(int mask);
+
+int evl_count_threads(int mask);
 
 bool evl_is_thread_file(struct file *filp);
 

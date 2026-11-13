@@ -1039,6 +1039,14 @@ static long latmus_ioctl(struct file *filp, unsigned int cmd,
 	struct evl_clock *clock;
 	int ret;
 
+	/*
+	 * doc 30: resetting or tuning the gravity shifts every EVL
+	 * timer, only EVL threads may do this.
+	 */
+	if ((cmd == EVL_LATIOC_RESET || cmd == EVL_LATIOC_TUNE) &&
+	    !evl_may_control())
+		return -EPERM;
+
 	if (cmd == EVL_LATIOC_RESET) {
 		clock = fetch_core_clock((clockid_t)arg);
 		if (!clock)

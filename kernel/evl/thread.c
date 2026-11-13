@@ -1478,6 +1478,29 @@ void evl_notify_thread(struct evl_thread *thread,
 }
 EXPORT_SYMBOL_GPL(evl_notify_thread);
 
+/*
+ * evl_count_threads - count the live EVL threads matching @mask
+ * (EVL_T_USER for user threads), the root threads excluded.
+ */
+int evl_count_threads(int mask)
+{
+	struct evl_thread *t;
+	unsigned long flags;
+	int count = 0;
+
+	raw_spin_lock_irqsave(&thread_list_lock, flags);
+
+	for_each_evl_thread(t) {
+		if ((t->state & EVL_T_ROOT) || (t->state & mask) != mask)
+			continue;
+		count++;
+	}
+
+	raw_spin_unlock_irqrestore(&thread_list_lock, flags);
+
+	return count;
+}
+
 int evl_killall(int mask)
 {
 	int nrkilled = 0, nrthreads, count;
@@ -2333,6 +2356,21 @@ static long __thread_ioctl(struct evl_thread *thread, unsigned int cmd,
 			ret = evl_ioctl_observable(thread->observable,
 						cmd, arg);
 		break;
+	case EVL_THRIOC_SET_SCHEDPARAM:
+	case EVL_THRIOC_SET_MODE:
+	case EVL_THRIOC_CLEAR_MODE:
+	case EVL_THRIOC_UNBLOCK:
+	case EVL_THRIOC_DEMOTE:
+	case EVL_THRIOC_SUSPEND:
+	case EVL_THRIOC_RESUME:
+		/*
+		 * doc 30: only EVL threads may control EVL threads. The
+		 * oob_ioctl() path needs no check, only EVL threads get
+		 * there.
+		 */
+		if (!evl_may_control())
+			break;
+		fallthrough;
 	default:
 		ret = thread_common_ioctl(thread, cmd, arg);
 	}

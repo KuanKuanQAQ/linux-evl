@@ -864,7 +864,7 @@ void finish_rq_switch(bool inband_tail, unsigned long flags)
 	 * Check whether we are completing a transition to the inband
 	 * stage for the current task, i.e.:
 	 *
-	 * irq_work_queue() ->
+	 * evl_inband_notify_post() ->
 	 *        IRQ:wake_up_process() ->
 	 *                         schedule() ->
 	 *                               back from dovetail_context_switch()
@@ -1127,7 +1127,8 @@ void evl_switch_inband_details(int cause, union evl_value details)
 	 * dovetail_leave_oob() below.
 	 */
 	hard_local_irq_disable();
-	irq_work_queue(&curr->inband_work);
+	/* Z -> z: record only, the relay does wake_up_process(). */
+	evl_inband_notify_post(&curr->inband_wakeup);
 
 	raw_spin_lock(&curr->lock);
 	this_rq = curr->rq;

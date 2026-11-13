@@ -12,7 +12,7 @@
 #include <linux/types.h>
 #include <linux/dovetail.h>
 #include <linux/completion.h>
-#include <linux/irq_work.h>
+#include <evl/inband_notify.h>
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
 #include <linux/ptrace.h>
@@ -148,7 +148,13 @@ struct evl_thread {
 		int active;
 	} poll_context;
 	atomic_t held_mutex_count;
-	struct irq_work inband_work;
+	/*
+	 * Z -> z, record only (doc 24): wake up the in-band task once
+	 * switched in-band, deliver pending in-band signals. Both
+	 * cookies are the task_struct, set when the thread is mapped.
+	 */
+	struct evl_inband_notify inband_wakeup;
+	struct evl_inband_notify inband_signals;
 	struct {
 		struct evl_opt_counter isw;	/* in-band switches */
 		struct evl_opt_counter csw;	/* context switches */
@@ -356,7 +362,7 @@ struct evl_kthread {
 	void (*threadfn)(void *arg);
 	int status;
 	void *arg;
-	struct irq_work irq_work;
+	struct evl_inband_notify done_notify;	/* completes ->done */
 };
 
 int __evl_run_kthread(struct evl_kthread *kthread, int clone_flags);

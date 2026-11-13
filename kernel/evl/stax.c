@@ -23,8 +23,6 @@
 /* The number of threads currently traversing the section. */
 #define STAX_CONCURRENCY_MASK (~(STAX_INBAND_BIT|STAX_CLAIMED_BIT))
 
-static void wakeup_inband_waiters(struct irq_work *work);
-
 void evl_init_stax(struct evl_stax *stax, int flags)
 {
 	atomic_set(&stax->gate, 0);
@@ -32,13 +30,16 @@ void evl_init_stax(struct evl_stax *stax, int flags)
 	evl_init_wait(&stax->oob_wait, &evl_mono_clock, EVL_WAIT_FIFO);
 	if (!(flags & EVL_STAX_INBAND_SPIN)) {
 		init_waitqueue_head(&stax->inband_wait);
-		init_irq_work(&stax->irq_work, wakeup_inband_waiters);
+		evl_init_inband_notify(&stax->notify, EVL_NOTIFY_WAKE_ALL,
+				0, &stax->inband_wait);
 	}
 }
 EXPORT_SYMBOL_GPL(evl_init_stax);
 
 void evl_destroy_stax(struct evl_stax *stax)
 {
+	if (!(stax->flags & EVL_STAX_INBAND_SPIN))
+		evl_inband_notify_drain(&stax->notify);
 	evl_destroy_wait(&stax->oob_wait);
 }
 EXPORT_SYMBOL_GPL(evl_destroy_stax);
@@ -288,13 +289,6 @@ int evl_trylock_stax(struct evl_stax *stax)
 }
 EXPORT_SYMBOL_GPL(evl_trylock_stax);
 
-static void wakeup_inband_waiters(struct irq_work *work)
-{
-	struct evl_stax *stax = container_of(work, struct evl_stax, irq_work);
-
-	wake_up_all(&stax->inband_wait);
-}
-
 static bool oob_unlock_sane(int gateval)
 {
 	return !EVL_WARN_ON(CORE,
@@ -341,8 +335,9 @@ static void unlock_from_oob(struct evl_stax *stax)
 
 	raw_spin_unlock_irqrestore(&stax->oob_wait.wchan.lock, flags);
 
+	/* Z -> z: record only, the relay does the wake_up_all(). */
 	if (!(new & STAX_CONCURRENCY_MASK))
-		irq_work_queue(&stax->irq_work);
+		evl_inband_notify_post(&stax->notify);
 }
 
 static inline bool inband_unlock_sane(int gateval)

@@ -9,7 +9,7 @@
 
 #include <linux/refcount.h>
 #include <linux/completion.h>
-#include <linux/irq_work.h>
+#include <evl/inband_notify.h>
 
 /*
  * This is a simple synchronization mechanism allowing an in-band
@@ -29,23 +29,22 @@
  * evl_pass_crossing() -> evl_reinit_crossing() -> evl_down_crossing().
  */
 
+/*
+ * The oob side never calls complete() itself: the last up() posts a
+ * notification record, the relay completes @passed in-band (doc 24).
+ * @passed is still a Linux object embedded here.
+ */
 struct evl_crossing {
 	refcount_t refs;
 	struct completion passed;
-	struct irq_work irq_work;
+	struct evl_inband_notify open;
 };
-
-static inline void evl_open_crossing(struct irq_work *work)
-{
-	struct evl_crossing *c = container_of(work, struct evl_crossing, irq_work);
-	complete(&c->passed);
-}
 
 static inline void evl_init_crossing(struct evl_crossing *c)
 {
 	refcount_set(&c->refs, 1);
 	init_completion(&c->passed);
-	init_irq_work(&c->irq_work, evl_open_crossing);
+	evl_init_inband_notify(&c->open, EVL_NOTIFY_COMPLETE, 0, &c->passed);
 }
 
 static inline void evl_reinit_crossing(struct evl_crossing *c)
@@ -63,18 +62,16 @@ static inline void evl_up_crossing(struct evl_crossing *c)
 {
 	/* CAUTION: See word of caution in the initial comment. */
 
-	if (refcount_dec_and_test(&c->refs)) {
-		if (running_inband() && !hard_irqs_disabled())
-			complete(&c->passed);
-		else
-			irq_work_queue(&c->irq_work);
-	}
+	if (refcount_dec_and_test(&c->refs))
+		evl_inband_notify_post(&c->open);
 }
 
 static inline void evl_pass_crossing(struct evl_crossing *c)
 {
 	if (!refcount_dec_and_test(&c->refs))
 		wait_for_completion(&c->passed);
+	/* The relay may still hold the record: let it go first. */
+	evl_inband_notify_drain(&c->open);
 }
 
 #endif /* !_EVL_CROSSING_H */

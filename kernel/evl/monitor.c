@@ -20,6 +20,33 @@ static __always_inline  atomic_t *__ATOMIC32(__u32 *ptr)
 	return (atomic_t *)ptr;
 }
 
+/*
+ * In-band side of an event monitor. The in-band kernel links its wait
+ * entries in there, so it does not live in the trusted monitor.
+ */
+struct evl_monitor_ib {
+	wait_queue_head_t wait_r;
+	wait_queue_head_t wait_w;
+};
+
+/*
+ * Z -> z: record only, the in-band handler of the relay does the
+ * wake_up() on the in-band wait queue (doc 29 §4). We post
+ * unconditionally instead of peeking at the in-band wait queue with
+ * waitqueue_active(): Z does not read in-band memory. A post with no
+ * in-band waiter costs one test_and_set_bit() when the record is
+ * already pending, an empty wake_up() otherwise.
+ */
+static void notify_inband_readers(struct evl_monitor *mon)
+{
+	evl_inband_notify_post(&mon->notify_r);
+}
+
+static void notify_inband_writers(struct evl_monitor *mon)
+{
+	evl_inband_notify_post(&mon->notify_w);
+}
+
 static struct evl_monitor *get_monitor_by_fundle(fundle_t fundle, int type)
 {
 	struct evl_monitor *mon = evl_lookup_ns(&evl_core_ns, fundle, monitor);
@@ -398,36 +425,9 @@ static int post_count(struct evl_monitor *mon, s32 sigval,
 	evl_schedule();
 
 	/* Wake up an in-band waiter last. */
-	smp_mb();
-	if (waitqueue_active(&mon->inband_wait_r)) {
-		if (running_inband()) {
-			wake_up(&mon->inband_wait_r);
-		} else {
-			evl_get_element(&mon->element);
-			if (!irq_work_queue(&mon->inband_wake_r))
-				evl_put_element(&mon->element);
-		}
-	}
+	notify_inband_readers(mon);
 
 	return 0;
-}
-
-static void inband_wake_r_irqwork(struct irq_work *work) /* in-band */
-{
-	struct evl_monitor *mon;
-
-	mon = container_of(work, struct evl_monitor, inband_wake_r);
-	wake_up(&mon->inband_wait_r);
-	evl_put_element(&mon->element);
-}
-
-static void inband_wake_w_irqwork(struct irq_work *work) /* in-band */
-{
-	struct evl_monitor *mon;
-
-	mon = container_of(work, struct evl_monitor, inband_wake_w);
-	wake_up(&mon->inband_wait_w);
-	evl_put_element(&mon->element);
 }
 
 /* mon->wait_queue.wchan.lock held, dropped on success, irqs off. */
@@ -590,16 +590,8 @@ static int post_mask(struct evl_monitor *mon, int bits, bool bcast)
 	 * Now wake up any in-band waiter if we still have events to
 	 * consume.
 	 */
-	smp_mb();
-	if (val && waitqueue_active(&mon->inband_wait_r)) {
-		if (running_inband()) {
-			wake_up(&mon->inband_wait_r);
-		} else {
-			evl_get_element(&mon->element);
-			if (!irq_work_queue(&mon->inband_wake_r))
-				evl_put_element(&mon->element);
-		}
-	}
+	if (val)
+		notify_inband_readers(mon);
 
 	return 0;
 }
@@ -752,7 +744,7 @@ static int unwait_monitor_oob(struct evl_monitor *mon,
 	({										\
 		__label__ __done, __out;						\
 		struct evl_wait_channel *wchan = &(__mon)->wait_queue.wchan; 		\
-		wait_queue_head_t *wq = &(__mon)->inband_wait_r;			\
+		wait_queue_head_t *wq = &(__mon)->ib->wait_r;				\
 		struct wait_queue_entry wq_entry;					\
 		unsigned long flags, ib_flags;						\
 		long jiffies = 0;							\
@@ -789,7 +781,7 @@ static int unwait_monitor_oob(struct evl_monitor *mon,
 											\
 			/* Wchan locked to serialize with post_{mask, count}(). */ 	\
 			if (list_empty(&wq_entry.entry))				\
-				__add_wait_queue(&(__mon)->inband_wait_r, &wq_entry);	\
+				__add_wait_queue(wq, &wq_entry);			\
 											\
 			__set_current_state(TASK_INTERRUPTIBLE);			\
 											\
@@ -845,9 +837,8 @@ static int wait_monitor_inband(struct evl_monitor *mon,
 		 * If we have successfully collected all the bits,
 		 * send a POLLOUT wakeup.
 		 */
-		smp_mb();	/* Matches mb in set_current_state() */
-		if (!ret && waitqueue_active(&mon->inband_wait_w))
-			wake_up(&mon->inband_wait_w);
+		if (!ret)
+			notify_inband_writers(mon);
 		break;
 	case EVL_EVENT_COUNT:
 		/*
@@ -1139,8 +1130,9 @@ static ssize_t monitor_common_write(struct file *filp, const char __user *u_buf,
 	if (mon->type != EVL_MONITOR_EVENT)
 		return -EINVAL;
 
-	ret = copy_from_user(&val, u_buf, sizeof(val));
-	if (ret)
+	/* Also reached from oob_write(): no might_fault() here. */
+	if (!access_ok(u_buf, sizeof(val)) ||
+		raw_copy_from_user(&val, u_buf, sizeof(val)))
 		return -EFAULT;
 
 	switch (mon->protocol) {
@@ -1207,8 +1199,8 @@ static __poll_t monitor_poll(struct file *filp, poll_table *wait)
 	if (mon->type != EVL_MONITOR_EVENT || mon->protocol != EVL_EVENT_MASK)
 		return -EINVAL;
 
-	poll_wait(filp, &mon->inband_wait_r, wait);
-	poll_wait(filp, &mon->inband_wait_w, wait);
+	poll_wait(filp, &mon->ib->wait_r, wait);
+	poll_wait(filp, &mon->ib->wait_w, wait);
 
 	val = atomic_read(__ATOMIC32(&mon->sstate->u.event.value));
 	if (val)
@@ -1251,6 +1243,7 @@ static struct evl_element *
 monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 		void __user *u_attrs, int clone_flags, u32 *sstate_offp)
 {
+	struct evl_monitor_ib *ib = NULL;
 	struct __evl_monitor_sstate *sstate;
 	struct evl_monitor_attrs attrs;
 	struct evl_monitor *mon;
@@ -1304,6 +1297,14 @@ monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 		goto fail_alloc;
 	}
 
+	if (attrs.type == EVL_MONITOR_EVENT) {
+		ib = kzalloc(sizeof(*ib), GFP_KERNEL);
+		if (ib == NULL) {
+			ret = -ENOMEM;
+			goto fail_ib;
+		}
+	}
+
 	ret = evl_init_user_element(&mon->element, &evl_monitor_factory,
 				u_name, clone_flags);
 	if (ret)
@@ -1339,10 +1340,13 @@ monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 		sstate->u.event.gate_offset = EVL_MONITOR_NOGATE;
 		atomic_set(__ATOMIC32(&sstate->u.event.value), attrs.initval);
 		evl_init_poll_head(&mon->poll_head);
-		init_waitqueue_head(&mon->inband_wait_r);
-		init_waitqueue_head(&mon->inband_wait_w);
-		init_irq_work(&mon->inband_wake_r, inband_wake_r_irqwork);
-		init_irq_work(&mon->inband_wake_w, inband_wake_w_irqwork);
+		mon->ib = ib;
+		init_waitqueue_head(&ib->wait_r);
+		init_waitqueue_head(&ib->wait_w);
+		evl_init_inband_notify(&mon->notify_r, EVL_NOTIFY_WAKE_UP,
+				0, &ib->wait_r);
+		evl_init_inband_notify(&mon->notify_w, EVL_NOTIFY_WAKE_UP,
+				0, &ib->wait_w);
 	}
 
 	/*
@@ -1368,6 +1372,8 @@ monitor_factory_build(struct evl_factory *fac, const char __user *u_name,
 fail_heap:
 	evl_destroy_element(&mon->element);
 fail_element:
+	kfree(ib);
+fail_ib:
 	kfree(mon);
 fail_alloc:
 	evl_put_clock(clock);
@@ -1385,6 +1391,14 @@ static void monitor_factory_dispose(struct evl_element *e)
 	evl_remove_ns(&evl_core_ns, e, monitor);
 
 	if (mon->type == EVL_MONITOR_EVENT) {
+		/*
+		 * No reference left, so no further post: wait for
+		 * the relay to let go of the records and of the
+		 * in-band wait queues they point at.
+		 */
+		evl_inband_notify_drain(&mon->notify_r);
+		evl_inband_notify_drain(&mon->notify_w);
+		kfree(mon->ib);
 		evl_put_clock(mon->wait_queue.clock);
 		evl_destroy_wait(&mon->wait_queue);
 		if (mon->gate) {

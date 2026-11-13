@@ -14,22 +14,25 @@
 #include <evl/factory.h>
 #include <evl/wait.h>
 #include <evl/poll.h>
+#include <evl/inband_notify.h>
 #include <uapi/evl/types-abi.h>
 #include <uapi/evl/observable-abi.h>
 
 struct file;
+struct evl_observable_ib;
 
 struct evl_observable {
 	struct evl_element element;
 	struct list_head observers; 	/* struct evl_observer */
 	struct list_head flush_list; 	/* struct evl_observer */
 	struct evl_wait_queue oob_wait;
-	wait_queue_head_t inband_wait_r;
-	wait_queue_head_t inband_wait_w;
+	struct evl_observable_ib *ib;	/* in-band wait queues, apart */
 	struct evl_poll_head poll_head;
-	struct irq_work wake_r_irqwork;
-	struct irq_work wake_w_irqwork;
-	struct irq_work flush_irqwork;
+	/* Z -> z, record only (doc 24). */
+	struct evl_inband_notify notify_r;
+	struct evl_inband_notify notify_w;
+	/* Deferred release of dropped observers, run in-band. */
+	struct evl_inband_notify flush_call;
 	hard_spinlock_t lock;		/* guards observers and flush_list */
 	u32 serial_counter;
 	int writable_observers;

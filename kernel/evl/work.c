@@ -34,23 +34,23 @@ void __evl_do_sync_work(struct work_struct *wq_work)
 }
 EXPORT_SYMBOL_GPL(__evl_do_sync_work);
 
-void __evl_do_irq_work(struct irq_work *irq_work)
+/* Called by the in-band handler of the notification relay. */
+void __evl_do_inband_kick(const struct evl_notify_event *ev)
 {
+	struct evl_work *work = ev->cookie;
 	struct evl_element *e;
-	struct evl_work *work;
 
-	work = container_of(irq_work, struct evl_work, irq_work);
 	e = work->element;	/* See comment in __evl_do_work(). */
 
 	if (!queue_work(work->wq, &work->wq_work) && e)
 		evl_put_element(e);
 }
-EXPORT_SYMBOL_GPL(__evl_do_irq_work);
+EXPORT_SYMBOL_GPL(__evl_do_inband_kick);
 
 void evl_init_work(struct evl_work *work,
 		void (*handler)(struct evl_work *work))
 {
-	init_irq_work(&work->irq_work, __evl_do_irq_work);
+	evl_init_inband_call(&work->kick, __evl_do_inband_kick, work, 0);
 	INIT_WORK(&work->wq_work, __evl_do_work);
 	work->handler_noreturn = (typeof(work->handler_noreturn))handler;
 	work->element = NULL;
@@ -71,7 +71,7 @@ void evl_init_sync_work(struct evl_sync_work *sync_work,
 {
 	struct evl_work *work = &sync_work->work;
 
-	init_irq_work(&work->irq_work, __evl_do_irq_work);
+	evl_init_inband_call(&work->kick, __evl_do_inband_kick, work, 0);
 	INIT_WORK(&work->wq_work, __evl_do_sync_work);
 	work->handler = (typeof(work->handler))handler;
 	/*
@@ -98,7 +98,8 @@ bool evl_call_inband_from(struct evl_work *work,
 	if (e)
 		evl_get_element(e);
 
-	if (!irq_work_queue(&work->irq_work)) {
+	/* Z -> z: record only. */
+	if (!evl_inband_notify_post(&work->kick)) {
 		if (e)
 			evl_put_element(e);
 		return false;

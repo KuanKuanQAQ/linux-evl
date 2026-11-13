@@ -13,7 +13,7 @@
 #include <linux/bits.h>
 #include <linux/list.h>
 #include <linux/rcupdate.h>
-#include <linux/irq_work.h>
+#include <evl/inband_notify.h>
 #include <linux/mutex.h>
 #include <linux/hashtable.h>
 #include <linux/refcount.h>
@@ -71,7 +71,7 @@ struct evl_element {
 	struct filename *devname;
 	unsigned int minor;
 	int clone_flags;
-	struct irq_work irq_work;
+	struct evl_inband_notify put_call;	/* last put from oob */
 	struct list_head flush;
 	struct hlist_node hash;
 	struct {

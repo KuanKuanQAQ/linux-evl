@@ -13,7 +13,6 @@
 #include <linux/slab.h>
 #include <linux/signal.h>
 #include <linux/sched.h>
-#include <linux/irq_work.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/types.h>
 #include <linux/sched/task.h>
@@ -55,7 +54,6 @@ static DECLARE_WAIT_QUEUE_HEAD(join_all);
 
 static const struct file_operations thread_fops;
 
-static void inband_task_wakeup(struct irq_work *work);
 
 static void timeout_handler(struct evl_timer *timer) /* oob stage stalled */
 {
@@ -175,6 +173,15 @@ static void pin_to_initial_cpu(struct evl_thread *thread)
 	raw_spin_unlock_irqrestore(&thread->lock, flags);
 }
 
+static void deliver_inband_signals(const struct evl_notify_event *ev);
+
+/* In-band, before dovetailing is enabled for @thread. */
+static void set_inband_notify_target(struct evl_thread *thread)
+{
+	thread->inband_wakeup.cookie = thread->altsched.task;
+	thread->inband_signals.cookie = thread->altsched.task;
+}
+
 int evl_init_thread(struct evl_thread *thread,
 		const struct evl_init_thread_attr *iattr,
 		struct evl_rq *rq,
@@ -235,7 +242,11 @@ int evl_init_thread(struct evl_thread *thread,
 	memset(&thread->poll_context, 0, sizeof(thread->poll_context));
 	memset(&thread->stat, 0, sizeof(thread->stat));
 	memset(&thread->altsched, 0, sizeof(thread->altsched));
-	init_irq_work(&thread->inband_work, inband_task_wakeup);
+	/* Cookies are set by set_inband_notify_target() when mapping. */
+	evl_init_inband_notify(&thread->inband_wakeup, EVL_NOTIFY_WAKE_TASK,
+			0, NULL);
+	evl_init_inband_call(&thread->inband_signals, deliver_inband_signals,
+			NULL, 0);
 
 	INIT_LIST_HEAD(&thread->next);
 	INIT_LIST_HEAD(&thread->boosters);
@@ -418,13 +429,6 @@ static void put_current_thread(void)
 	evl_put_element(&curr->element);
 }
 
-static void wakeup_kthread_parent(struct irq_work *irq_work)
-{
-	struct evl_kthread *kthread;
-	kthread = container_of(irq_work, struct evl_kthread, irq_work);
-	complete(&kthread->done);
-}
-
 static int map_kthread_self(struct evl_kthread *kthread)
 {
 	struct evl_thread *curr = &kthread->thread;
@@ -432,6 +436,7 @@ static int map_kthread_self(struct evl_kthread *kthread)
 	pin_to_initial_cpu(curr);
 
 	dovetail_init_altsched(&curr->altsched);
+	set_inband_notify_target(curr);
 	set_oob_threadinfo(curr);
 	dovetail_start_altsched();
 	evl_release_thread(curr, EVL_T_DORMANT);
@@ -448,13 +453,14 @@ static int map_kthread_self(struct evl_kthread *kthread)
 	/*
 	 * We are now running out-of-band, therefore
 	 * __evl_run_kthread() can't start us before we enter the
-	 * dormant state because irq_work_queue() schedules the
-	 * in-band wakeup request on the current CPU. If we fail
+	 * dormant state because the notification relay delivers the
+	 * in-band completion on the current CPU. If we fail
 	 * switching to the out-of-band stage, kthread->status tells
 	 * __evl_run_kthread() not to start but cancel us instead.
 	 */
-	init_irq_work(&kthread->irq_work, wakeup_kthread_parent);
-	irq_work_queue(&kthread->irq_work);
+	evl_init_inband_notify(&kthread->done_notify, EVL_NOTIFY_COMPLETE,
+			0, &kthread->done);
+	evl_inband_notify_post(&kthread->done_notify);
 
 	enqueue_new_thread(curr);
 	evl_hold_thread(curr, EVL_T_DORMANT);
@@ -527,6 +533,7 @@ int __evl_run_kthread(struct evl_kthread *kthread, int clone_flags)
 
 	evl_add_ns(&evl_core_ns, &thread->element, thread);
 	wait_for_completion(&kthread->done);
+	evl_inband_notify_drain(&kthread->done_notify);
 	if (kthread->status)
 		return kthread->status;
 
@@ -806,17 +813,6 @@ void evl_release_thread(struct evl_thread *thread, int mask)
 	rq = evl_get_thread_rq(thread, flags);
 	evl_release_thread_locked(thread, mask);
 	evl_put_thread_rq(thread, rq, flags);
-}
-
-static void inband_task_wakeup(struct irq_work *work)
-{
-	struct evl_thread *thread;
-	struct task_struct *p;
-
-	thread = container_of(work, struct evl_thread, inband_work);
-	p = thread->altsched.task;
-	trace_evl_inband_wakeup(p);
-	wake_up_process(p);
 }
 
 void evl_set_kthread_priority(struct evl_kthread *kthread, int priority)
@@ -1403,18 +1399,9 @@ void evl_demote_thread(struct evl_thread *thread)
 }
 EXPORT_SYMBOL_GPL(evl_demote_thread);
 
-struct sig_irqwork_data {
-	struct evl_thread *thread;
-	int signo, sigval;
-	struct irq_work work;
-};
-
-static void do_inband_signal(struct evl_thread *thread, int signo, int sigval)
+static void send_inband_signal(struct task_struct *p, int signo, int sigval)
 {
-	struct task_struct *p = thread->altsched.task;
 	struct kernel_siginfo si;
-
-	trace_evl_inband_signal(thread, signo, sigval);
 
 	if (signo == SIGDEBUG) {
 		memset(&si, '\0', sizeof(si));
@@ -1427,37 +1414,45 @@ static void do_inband_signal(struct evl_thread *thread, int signo, int sigval)
 	}
 }
 
-static void sig_irqwork(struct irq_work *work)
+/*
+ * Called by the in-band handler of the notification relay: send every
+ * signal posted since the last delivery. The cookie is the in-band
+ * task, the trusted thread is never dereferenced here.
+ */
+static void deliver_inband_signals(const struct evl_notify_event *ev)
 {
-	struct sig_irqwork_data *sigd;
+	unsigned long pending = ev->bits;
+	int signo;
 
-	sigd = container_of(work, struct sig_irqwork_data, work);
-	do_inband_signal(sigd->thread, sigd->signo, sigd->sigval);
-	evl_put_element(&sigd->thread->element);
-	evl_free_rcu(sigd);
+	if (ev->cookie == NULL)	/* not mapped yet */
+		return;
+
+	for_each_set_bit(signo, &pending, BITS_PER_LONG)
+		send_inband_signal(ev->cookie, signo,
+				signo == SIGDEBUG ? ev->value : 0);
 }
 
+/*
+ * Z -> z: record only (doc 24). Pending signals accumulate in a
+ * fixed record of the thread instead of one trusted allocation per
+ * signal, so an in-band side which never delivers cannot exhaust the
+ * trusted heap. Signals posted before a delivery coalesce, like
+ * standard signals do; the last SIGDEBUG reason wins.
+ */
 void evl_signal_thread(struct evl_thread *thread, int sig, int arg)
 {
-	struct sig_irqwork_data *sigd;
-
 	if (EVL_WARN_ON(CORE, !(thread->state & EVL_T_USER)))
 		return;
 
-	if (running_inband()) {
-		do_inband_signal(thread, sig, arg);
+	if (EVL_WARN_ON(CORE, sig <= 0 || sig >= BITS_PER_LONG))
 		return;
-	}
 
-	sigd = evl_alloc(sizeof(*sigd));
-	init_irq_work(&sigd->work, sig_irqwork);
-	sigd->thread = thread;
-	sigd->signo = sig;
-	sigd->sigval = arg;
+	trace_evl_inband_signal(thread, sig, arg);
 
-	evl_get_element(&thread->element);
-	/* Cannot fail, irq_work is local to this call. */
-	irq_work_queue(&sigd->work);
+	if (sig == SIGDEBUG)
+		evl_inband_notify_set_value(&thread->inband_signals, arg);
+
+	evl_inband_notify_post_bits(&thread->inband_signals, BIT(sig));
 }
 EXPORT_SYMBOL_GPL(evl_signal_thread);
 
@@ -2483,6 +2478,7 @@ static int map_uthread_self(struct evl_thread *thread)
 	trace_evl_thread_map(thread);
 
 	dovetail_init_altsched(&thread->altsched);
+	set_inband_notify_target(thread);
 	set_oob_threadinfo(thread);
 	set_oob_mminfo(thread);
 
@@ -2667,6 +2663,10 @@ static void thread_factory_dispose(struct evl_element *e)
 		cleanup_current_thread();
 		evl_destroy_element(&thread->element);
 	}
+
+	/* No reference left, no further post. */
+	evl_inband_notify_drain(&thread->inband_wakeup);
+	evl_inband_notify_drain(&thread->inband_signals);
 
 	if (state & EVL_T_USER)
 		kfree_rcu(thread, element.rcu);

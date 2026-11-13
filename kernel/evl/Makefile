@@ -5,6 +5,7 @@ evl-y :=		\
 	control.o	\
 	factory.o	\
 	file.o		\
+	inband_notify.o	\
 	init.o		\
 	memory.o	\
 	monitor.o	\

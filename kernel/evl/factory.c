@@ -15,7 +15,6 @@
 #include <linux/module.h>
 #include <linux/rcupdate.h>
 #include <linux/uidgid.h>
-#include <linux/irq_work.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
 #include <linux/stringhash.h>
@@ -31,6 +30,7 @@
 #include <evl/lkl.h>
 #include <evl/control.h>
 #include <evl/factory.h>
+#include <evl/inband_notify.h>
 #include <evl/uaccess.h>
 #include <uapi/evl/syscall-abi.h>
 
@@ -62,7 +62,7 @@ static struct evl_factory *factories[] = {
 
 static dev_t factory_rdev;
 
-static struct task_struct flusher_kthread;
+static struct task_struct *flusher_kthread;
 
 static wait_queue_head_t flusher_wait;
 
@@ -230,12 +230,9 @@ static void __do_put_element(struct evl_element *e)
 	fac->dispose(e);
 }
 
-static void do_put_element_irq(struct irq_work *work)
+static void queue_flush_element(struct evl_element *e)
 {
-	struct evl_element *e;
 	unsigned long flags;
-
-	e = container_of(work, struct evl_element, irq_work);
 
 	/*
 	 * Queue the flushable element then wake the flusher up if
@@ -248,6 +245,16 @@ static void do_put_element_irq(struct irq_work *work)
 		wake_up_locked(&flusher_wait);
 
 	spin_unlock_irqrestore(&flusher_wait.lock, flags);
+}
+
+/*
+ * Called by the in-band handler of the notification relay. One-shot:
+ * the element may be gone as soon as it is queued, the relay does not
+ * touch the record afterwards.
+ */
+static void put_element_call(const struct evl_notify_event *ev)
+{
+	queue_flush_element(ev->cookie);
 }
 
 void __evl_put_element(struct evl_element *e)
@@ -277,15 +284,16 @@ void __evl_put_element(struct evl_element *e)
 	 * (i.e. fully synchronous path).
 	 *
 	 * 3. the last reference to an element might be dropped either
-	 * from oob context or inband while hard irqs are off. To
-	 * address this we need an irq work trampoline for queuing the
-	 * element to the flush queue. Note that irq_work_queue() does
-	 * not synchronize the interrupt log when called with hard
-	 * irqs off.
+	 * from oob context or inband while hard irqs are off. The
+	 * trusted side only posts a one-shot notification record
+	 * (doc 24), the in-band handler of the relay queues the
+	 * element to the flush queue. The post does not synchronize
+	 * the interrupt log when called with hard irqs off.
 	 */
 	if (unlikely(running_oob() || hard_irqs_disabled())) {
-		init_irq_work(&e->irq_work, do_put_element_irq);
-		irq_work_queue(&e->irq_work);
+		evl_init_inband_call(&e->put_call, put_element_call, e, 0);
+		evl_set_inband_notify_oneshot(&e->put_call);
+		evl_inband_notify_post(&e->put_call);
 	} else {
 		/*
 		 * If the calling context is a workqueue worker, we
@@ -294,7 +302,7 @@ void __evl_put_element(struct evl_element *e)
 		 * (and must) run the disposal code directly.
 		 */
 		if (current_work())
-			do_put_element_irq(&e->irq_work);
+			queue_flush_element(e);
 		else
 			__do_put_element(e);
 	}
@@ -542,7 +550,7 @@ int evl_create_core_device(struct evl_element *e,
 
 	if (name) {
 		devname = getname_kernel(name);
-		if (devname == NULL)
+		if (IS_ERR(devname))
 			return PTR_ERR(devname);
 		e->devname = devname;
 	}
@@ -884,7 +892,7 @@ int evl_create_factory(struct evl_factory *fac)
 
 	ret = alloc_chrdev_region(&fac->sub_rdev, 0, 1, fac->name);
 	if (ret)
-		return ret;;
+		return ret;
 
 	ret = create_factory(fac, MKDEV(MAJOR(fac->sub_rdev), 0));
 	if (ret)
@@ -918,11 +926,12 @@ int __init evl_early_init_factories(void)
 		goto fail_region;
 
 	init_waitqueue_head(&flusher_wait);
-	p = kthread_run(factory_flusher, &flusher_kthread, "evl_flusher");
+	p = kthread_run(factory_flusher, NULL, "evl_flusher");
 	if (IS_ERR(p)) {
 		ret = PTR_ERR(p);
 		goto fail_kthread;
 	}
+	flusher_kthread = p;
 
 	ret = create_core_factories(early_factories,
 			ARRAY_SIZE(early_factories));
@@ -932,7 +941,7 @@ int __init evl_early_init_factories(void)
 	return 0;
 
 fail_factories:
-	kthread_stop(&flusher_kthread);
+	kthread_stop(flusher_kthread);
 fail_kthread:
 	unregister_chrdev_region(factory_rdev, NR_FACTORIES);
 fail_region:
@@ -945,8 +954,7 @@ void __init evl_early_cleanup_factories(void)
 {
 	delete_core_factories(early_factories, ARRAY_SIZE(early_factories));
 	unregister_chrdev_region(factory_rdev, NR_FACTORIES);
-	kthread_stop(&flusher_kthread);
-	wake_up(&flusher_wait);
+	kthread_stop(flusher_kthread);
 	class_destroy(evl_class);
 }
 

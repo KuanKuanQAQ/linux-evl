@@ -7,6 +7,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <evl/init.h>
+#include <evl/inband_notify.h>
 #include <evl/sched.h>
 #include <evl/clock.h>
 #include <evl/timer.h>
@@ -93,11 +94,15 @@ static __init int init_core(void)
 	if (ret)
 		goto cleanup_stage;
 
+	ret = evl_inband_notify_init();
+	if (ret)
+		goto cleanup_memory;
+
 	evl_init_core_ns(&evl_core_ns);
 
 	ret = evl_early_init_factories();
 	if (ret)
-		goto cleanup_memory;
+		goto cleanup_notify;
 
 	ret = evl_clock_init();
 	if (ret)
@@ -154,6 +159,8 @@ cleanup_clock:
 	evl_clock_cleanup();
 cleanup_early_factories:
 	evl_early_cleanup_factories();
+cleanup_notify:
+	evl_inband_notify_cleanup();
 cleanup_memory:
 	evl_cleanup_memory();
 cleanup_stage:

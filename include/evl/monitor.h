@@ -9,13 +9,15 @@
 
 #include <linux/list.h>
 #include <linux/wait.h>
-#include <linux/irq_work.h>
 #include <evl/wait.h>
 #include <evl/thread.h>
 #include <evl/mutex.h>
 #include <evl/poll.h>
 #include <evl/factory.h>
+#include <evl/inband_notify.h>
 #include <uapi/evl/monitor-abi.h>
+
+struct evl_monitor_ib;
 
 struct evl_monitor {
 	struct evl_element element;
@@ -31,14 +33,14 @@ struct evl_monitor {
 		struct {
 			/* Out-of-band wait queue. */
 			struct evl_wait_queue wait_queue;
-			/* In-band wait queue (read side). */
-			wait_queue_head_t inband_wait_r;
-			/* In-band wait queue (write side). */
-			wait_queue_head_t inband_wait_w;
-			/* In-band wake up work (read side). */
-			struct irq_work inband_wake_r;
-			/* In-band wake up work (write side). */
-			struct irq_work inband_wake_w;
+			/*
+			 * In-band side: Linux wait queues, allocated
+			 * apart since the in-band kernel writes them.
+			 */
+			struct evl_monitor_ib *ib;
+			/* Z -> z wake ups, record only (doc 24). */
+			struct evl_inband_notify notify_r;
+			struct evl_inband_notify notify_w;
 			/* Gate (valid during active wait only). */
 			struct evl_monitor *gate;
 			/* Out-of-band poll head. */

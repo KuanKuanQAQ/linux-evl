@@ -19,6 +19,33 @@
 /* Co-exists with EVL_NOTIFY_MASK bits. */
 #define EVL_NOTIFY_INITIAL	(1 << 31)
 
+/*
+ * In-band side of an observable: the in-band kernel links its wait
+ * entries in there, so it does not live in the trusted object.
+ */
+struct evl_observable_ib {
+	wait_queue_head_t wait_r;
+	wait_queue_head_t wait_w;
+};
+
+/*
+ * Z -> z: record only, the in-band handler of the relay does the
+ * wake_up() on the in-band wait queue (doc 29 §4). We post
+ * unconditionally instead of peeking at the in-band wait queue with
+ * waitqueue_active(): Z does not read in-band memory. A post with no
+ * in-band waiter costs one test_and_set_bit() when the record is
+ * already pending, an empty wake_up() otherwise.
+ */
+static void notify_inband_readers(struct evl_observable *observable)
+{
+	evl_inband_notify_post(&observable->notify_r);
+}
+
+static void notify_inband_writers(struct evl_observable *observable)
+{
+	evl_inband_notify_post(&observable->notify_w);
+}
+
 #define EVL_OBSERVABLE_CLONE_FLAGS	(EVL_CLONE_PUBLIC|EVL_CLONE_SHAREABLE| \
 					 EVL_CLONE_OBSERVABLE|EVL_CLONE_UNICAST)
 
@@ -195,9 +222,7 @@ static int add_subscription(struct evl_observable *observable,
 	raw_spin_unlock_irqrestore(&observable->lock, flags);
 	evl_signal_poll_events(&observable->poll_head, POLLOUT|POLLWRNORM);
 	evl_schedule();
-	smp_mb();
-	if (waitqueue_active(&observable->inband_wait_w))
-		wake_up(&observable->inband_wait_w);
+	notify_inband_writers(observable);
 
 	evl_put_element(&observable->element);
 
@@ -348,24 +373,6 @@ void evl_drop_subscriptions(struct evl_subscriber *sbr)
 	kfree(sbr);
 }
 
-static void inband_wake_r_irqwork(struct irq_work *work)
-{
-	struct evl_observable *observable;
-
-	observable = container_of(work, struct evl_observable, wake_r_irqwork);
-	wake_up(&observable->inband_wait_r);
-	evl_put_element(&observable->element);
-}
-
-static void inband_wake_w_irqwork(struct irq_work *work)
-{
-	struct evl_observable *observable;
-
-	observable = container_of(work, struct evl_observable, wake_w_irqwork);
-	wake_up(&observable->inband_wait_w);
-	evl_put_element(&observable->element);
-}
-
 void evl_flush_observable(struct evl_observable *observable)
 {
 	struct evl_observer *observer, *tmp;
@@ -436,13 +443,14 @@ static void do_flush_work(struct evl_observable *observable)
 	raw_spin_unlock_irqrestore(&observable->lock, flags);
 }
 
-static void inband_flush_irqwork(struct irq_work *work)
+/*
+ * Gate, called by the relay in-band: release the observers dropped
+ * from the oob stage. Safe to run at any time while the observable
+ * exists; the in-band side may only delay it (memory is held longer).
+ */
+static void inband_flush_call(const struct evl_notify_event *ev)
 {
-	struct evl_observable *observable;
-
-	observable = container_of(work, struct evl_observable, flush_irqwork);
-	do_flush_work(observable);
-	evl_put_element(&observable->element);
+	do_flush_work(ev->cookie);
 }
 
 static bool notify_one_observer(struct evl_observable *observable,
@@ -625,13 +633,10 @@ static bool push_notification(struct evl_observable *observable,
 		do_flush = notify_all(observable, &nfr, &len);
 
 	if (unlikely(do_flush)) {
-		if (running_inband()) {
+		if (running_inband())
 			do_flush_work(observable);
-		} else {
-			evl_get_element(&observable->element);
-			if (!irq_work_queue(&observable->flush_irqwork))
-				evl_put_element(&observable->element);
-		}
+		else
+			evl_inband_notify_post(&observable->flush_call);
 	}
 
 	return len > 0;  /* True if some subscribers could receive. */
@@ -651,21 +656,7 @@ static void wake_up_observers(struct evl_observable *observable)
 	evl_signal_poll_events(&observable->poll_head, POLLIN|POLLRDNORM);
 	evl_schedule();
 
-	smp_mb();
-	if (waitqueue_active(&observable->inband_wait_r)) {
-		/*
-		 * If running oob, we need to go through the
-		 * wake_irqwork trampoline for waking up in-band
-		 * waiters.
-		 */
-		if (running_inband()) {
-			wake_up(&observable->inband_wait_r);
-		} else {
-			evl_get_element(&observable->element);
-			if (!irq_work_queue(&observable->wake_r_irqwork))
-				evl_put_element(&observable->element);
-		}
-	}
+	notify_inband_readers(observable);
 }
 
 bool evl_send_observable(struct evl_observable *observable, int tag,
@@ -790,7 +781,7 @@ pull_from_inband(struct evl_observable *observable,
 	 * In-band lock first, oob next. See stax implementation for
 	 * an explanation.
 	 */
-	spin_lock_irqsave(&observable->inband_wait_r.lock, ib_flags);
+	spin_lock_irqsave(&observable->ib->wait_r.lock, ib_flags);
 	raw_spin_lock_irqsave(&observable->oob_wait.wchan.lock, oob_flags);
 
 	for (;;) {
@@ -800,7 +791,7 @@ pull_from_inband(struct evl_observable *observable,
 		 * for the underlying file, obviously.
 		 */
 		if (list_empty(&wq_entry.entry))
-			__add_wait_queue(&observable->inband_wait_r, &wq_entry);
+			__add_wait_queue(&observable->ib->wait_r, &wq_entry);
 
 		if (!list_empty(&observer->pending_list)) {
 			nfr = list_get_entry(&observer->pending_list,
@@ -813,9 +804,9 @@ pull_from_inband(struct evl_observable *observable,
 		}
 		set_current_state(TASK_INTERRUPTIBLE);
 		raw_spin_unlock_irqrestore(&observable->oob_wait.wchan.lock, oob_flags);
-		spin_unlock_irqrestore(&observable->inband_wait_r.lock, ib_flags);
+		spin_unlock_irqrestore(&observable->ib->wait_r.lock, ib_flags);
 		schedule();
-		spin_lock_irqsave(&observable->inband_wait_r.lock, ib_flags);
+		spin_lock_irqsave(&observable->ib->wait_r.lock, ib_flags);
 		raw_spin_lock_irqsave(&observable->oob_wait.wchan.lock, oob_flags);
 
 		if (signal_pending(current)) {
@@ -827,7 +818,7 @@ pull_from_inband(struct evl_observable *observable,
 	list_del(&wq_entry.entry);
 
 	raw_spin_unlock_irqrestore(&observable->oob_wait.wchan.lock, oob_flags);
-	spin_unlock_irqrestore(&observable->inband_wait_r.lock, ib_flags);
+	spin_unlock_irqrestore(&observable->ib->wait_r.lock, ib_flags);
 
 	return ret ? ERR_PTR(ret) : nfr;
 }
@@ -885,16 +876,7 @@ static int pull_notification(struct evl_observable *observable,
 		evl_signal_poll_events(&observable->poll_head,
 				POLLOUT|POLLWRNORM);
 		evl_schedule();
-		smp_mb();
-		if (waitqueue_active(&observable->inband_wait_w)) {
-			if (running_inband()) {
-				wake_up(&observable->inband_wait_w);
-			} else {
-				evl_get_element(&observable->element);
-				if (!irq_work_queue(&observable->wake_w_irqwork))
-					evl_put_element(&observable->element);
-			}
-		}
+		notify_inband_writers(observable);
 	}
 
 	return ret;
@@ -988,8 +970,8 @@ __poll_t evl_oob_poll_observable(struct evl_observable *observable,
 __poll_t evl_poll_observable(struct evl_observable *observable,
 			struct file *filp, poll_table *pt)
 {
-	poll_wait(filp, &observable->inband_wait_r, pt);
-	poll_wait(filp, &observable->inband_wait_w, pt);
+	poll_wait(filp, &observable->ib->wait_r, pt);
+	poll_wait(filp, &observable->ib->wait_w, pt);
 
 	return poll_observable(observable);
 }
@@ -1108,10 +1090,17 @@ struct evl_observable *evl_alloc_observable(const char __user *u_name,
 	if (observable == NULL)
 		return ERR_PTR(-ENOMEM);
 
+	observable->ib = kzalloc(sizeof(*observable->ib), GFP_KERNEL);
+	if (observable->ib == NULL) {
+		kfree(observable);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	ret = evl_init_user_element(&observable->element,
 				&evl_observable_factory, u_name,
 				clone_flags | EVL_CLONE_OBSERVABLE);
 	if (ret) {
+		kfree(observable->ib);
 		kfree(observable);
 		return ERR_PTR(ret);
 	}
@@ -1119,11 +1108,14 @@ struct evl_observable *evl_alloc_observable(const char __user *u_name,
 	INIT_LIST_HEAD(&observable->observers);
 	INIT_LIST_HEAD(&observable->flush_list);
 	evl_init_wait(&observable->oob_wait, &evl_mono_clock, EVL_WAIT_PRIO);
-	init_waitqueue_head(&observable->inband_wait_r);
-	init_waitqueue_head(&observable->inband_wait_w);
-	init_irq_work(&observable->wake_r_irqwork, inband_wake_r_irqwork);
-	init_irq_work(&observable->wake_w_irqwork, inband_wake_w_irqwork);
-	init_irq_work(&observable->flush_irqwork, inband_flush_irqwork);
+	init_waitqueue_head(&observable->ib->wait_r);
+	init_waitqueue_head(&observable->ib->wait_w);
+	evl_init_inband_notify(&observable->notify_r, EVL_NOTIFY_WAKE_UP,
+			0, &observable->ib->wait_r);
+	evl_init_inband_notify(&observable->notify_w, EVL_NOTIFY_WAKE_UP,
+			0, &observable->ib->wait_w);
+	evl_init_inband_call(&observable->flush_call, inband_flush_call,
+			observable, 0);
 	evl_init_poll_head(&observable->poll_head);
 	raw_spin_lock_init(&observable->lock);
 	evl_add_ns(&evl_core_ns, &observable->element, observable);
@@ -1152,6 +1144,11 @@ static void observable_factory_dispose(struct evl_element *e)
 	struct evl_observable *observable;
 
 	observable = container_of(e, struct evl_observable, element);
+	/* No reference left, no further post. */
+	evl_inband_notify_drain(&observable->notify_r);
+	evl_inband_notify_drain(&observable->notify_w);
+	evl_inband_notify_drain(&observable->flush_call);
+	kfree(observable->ib);
 	evl_destroy_wait(&observable->oob_wait);
 	evl_remove_ns(&evl_core_ns, e, observable);
 	evl_destroy_element(&observable->element);

@@ -1092,12 +1092,20 @@ static ktime_t read_mono_clock(struct evl_clock *clock)
 
 static ktime_t read_mono_raw_clock(struct evl_clock *clock)
 {
+#ifdef CONFIG_EVL_LKL_CLOCK
+	return ns_to_ktime(lkl_ktime_get_raw_fast_ns());
+#else
 	return ns_to_ktime(ktime_get_raw_fast_ns());
+#endif
 }
 
 static ktime_t read_realtime_clock(struct evl_clock *clock)
 {
+#ifdef CONFIG_EVL_LKL_CLOCK
+	return ns_to_ktime(lkl_ktime_get_real_fast_ns());
+#else
 	return ns_to_ktime(ktime_get_real_fast_ns());
+#endif
 }
 
 static void adjust_realtime_clock(struct evl_clock *clock)

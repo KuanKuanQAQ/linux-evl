@@ -41,6 +41,45 @@ config EVL_SCHED_TP_NR_PART
 config EVL_TIMER_SCALABLE
 	bool
 
+config EVL_LKL
+	bool "Statically embed the complete LKL kernel"
+	depends on X86_64 && CC_IS_GCC && !LTO_CLANG && !CFI
+	default y
+	help
+	  Build and statically link the complete configured LKL kernel with
+	  kernel-compatible x86-64 compiler options. LKL symbols and special
+	  sections are isolated from this outer kernel. LKL is not booted by
+	  this option; stateful entry points still require host operations.
+
+	  Set LKL_SRC when building to locate the modified LKL source tree.
+	  The default is the sibling lkl submodule. Set LKL_CONFIG to override
+	  its arch/lkl/configs/defconfig. With this option disabled the EVL
+	  helpers are linked from the prebuilt lkl_blob.o_shipped instead.
+	  The embedded build uses a separate output directory and does not
+	  replace the user-space liblkl build.
+
+config EVL_LKL_RUNTIME
+	bool "Boot embedded LKL using Linux kernel host operations"
+	depends on EVL_LKL
+	default n
+	help
+	  Start the embedded NOMMU LKL instance before EVL core initialization.
+	  Host threads, synchronization, memory and timers are provided by the
+	  outer Linux kernel in in-band context. This does not make stateful
+	  LKL entry points safe to call from EVL out-of-band or hard IRQ context.
+	  Set evl.lkl_boot=0 on the kernel command line to skip LKL boot.
+
+config EVL_LKL_CLOCK
+	bool "Use the embedded LKL independent timekeeper"
+	depends on EVL_LKL_RUNTIME
+	default y
+	help
+	  Read EVL time from LKL's own timekeeper and x86 KVM pvclock
+	  backend. The host provides a one-time alignment sample and startup
+	  resource mappings only. LKL failure or evl.lkl_boot=0 prevents EVL
+	  startup; there is no runtime fallback to the host timekeeper.
+	  Requires RDTSCP, stable KVM pvclock and a fixed set of online CPUs.
+
 config EVL_SCHED_SCALABLE
 	bool
 

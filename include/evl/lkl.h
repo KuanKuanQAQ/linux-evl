@@ -27,7 +27,23 @@ unsigned long lkl_evl_int_sqrt(unsigned long x);
 
 #define evl_ktime_to_timespec64(kt)	lkl_evl_ns_to_timespec64(kt)
 
-/* Host services lkl.o depends on, implemented in kernel/evl/lkl_host.c. */
+#ifdef CONFIG_EVL_LKL_CLOCK
+u64 lkl_ktime_get_mono_fast_ns(void);
+u64 lkl_ktime_get_raw_fast_ns(void);
+u64 lkl_ktime_get_real_fast_ns(void);
+unsigned long long lkl_clock_read_counter(void);
+int lkl_clock_is_ready(void);
+#endif
+
+#ifdef CONFIG_EVL_LKL_RUNTIME
+int evl_lkl_start_runtime(void);
+void evl_lkl_stop_runtime(void);
+#else
+static inline int evl_lkl_start_runtime(void) { return 0; }
+static inline void evl_lkl_stop_runtime(void) { }
+#endif
+
+/* Diagnostics required by the linked LKL core. */
 int lkl_printf(const char *fmt, ...);
 void lkl_bug(const char *fmt, ...);
 

@@ -67,7 +67,7 @@ static int start_services(void)
 	return ret;
 }
 
-static int stop_services(void)
+int evl_stop_services(void)
 {
 	enum evl_run_states state;
 	int ret = 0;
@@ -488,7 +488,7 @@ static ssize_t state_store(struct device *dev,
 		return start_services() ?: count;
 
 	if (!lkl_evl_strncmp(buf, "stop", len))
-		return stop_services() ?: count;
+		return evl_stop_services() ?: count;
 
 	return -EINVAL;
 }

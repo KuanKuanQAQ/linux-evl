@@ -81,7 +81,11 @@ void evl_stop_timers(struct evl_clock *clock);
 
 static inline ktime_t evl_ktime_monotonic(void)
 {
+#ifdef CONFIG_EVL_LKL_CLOCK
+	return lkl_ktime_get_mono_fast_ns();
+#else
 	return ktime_get_mono_fast_ns();
+#endif
 }
 
 /*

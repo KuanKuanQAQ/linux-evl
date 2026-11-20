@@ -198,6 +198,10 @@ static int __init evl_init(void)
 	/* Threads may run on any out-of-band CPU by default. */
 	evl_cpu_affinity = evl_oob_cpus;
 
+	ret = evl_lkl_start_runtime();
+	if (ret)
+		goto fail;
+
 	ret = EVL_INIT_CALL(0, init_core());
 	if (ret)
 		goto fail;
@@ -212,6 +216,7 @@ static int __init evl_init(void)
 
 	return 0;
 fail:
+	evl_lkl_stop_runtime();
 	set_evl_state(EVL_STATE_DISABLED);
 
 	printk(EVL_ERR "disabling.\n");

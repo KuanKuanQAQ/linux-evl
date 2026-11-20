@@ -16,7 +16,7 @@
 #ifdef CONFIG_SMP
 
 static struct evl_timerbase *
-lock_timer_base(struct evl_timer *timer, unsigned long *flags)
+lock_timer_base(struct evl_timer *timer, unsigned long *flags) /* 获取并锁定定时器当前所属的定时器基。 */
 {
 	struct evl_timerbase *base;
 
@@ -35,7 +35,7 @@ lock_timer_base(struct evl_timer *timer, unsigned long *flags)
 	return base;
 }
 
-static inline void unlock_timer_base(struct evl_timerbase *base,
+static inline void unlock_timer_base(struct evl_timerbase *base, /* 解锁定时器基并恢复中断状态。 */
 				unsigned long flags)
 {
 	raw_spin_unlock_irqrestore(&base->lock, flags);
@@ -44,14 +44,14 @@ static inline void unlock_timer_base(struct evl_timerbase *base,
 #else
 
 static inline struct evl_timerbase *
-lock_timer_base(struct evl_timer *timer, unsigned long *flags)
+lock_timer_base(struct evl_timer *timer, unsigned long *flags) /* 在单处理器模式下保存中断状态并获取定时器基。 */
 {
 	*flags = hard_local_irq_save();
 
 	return timer->base;
 }
 
-static inline void unlock_timer_base(struct evl_timerbase *base,
+static inline void unlock_timer_base(struct evl_timerbase *base, /* 在单处理器模式下恢复之前保存的中断状态。 */
 				unsigned long flags)
 {
 	hard_local_irq_restore(flags);
@@ -60,7 +60,7 @@ static inline void unlock_timer_base(struct evl_timerbase *base,
 #endif
 
 /* hard irqs off */
-static inline void double_timer_base_lock(struct evl_timerbase *tb1,
+static inline void double_timer_base_lock(struct evl_timerbase *tb1, /* 按固定顺序获取两个定时器基的锁以避免死锁。 */
 					struct evl_timerbase *tb2)
 {
 	if (tb1 == tb2)
@@ -74,7 +74,7 @@ static inline void double_timer_base_lock(struct evl_timerbase *tb1,
 	}
 }
 
-static inline void double_timer_base_unlock(struct evl_timerbase *tb1,
+static inline void double_timer_base_unlock(struct evl_timerbase *tb1, /* 释放两个定时器基的锁。 */
 					struct evl_timerbase *tb2)
 {
 	raw_spin_unlock(&tb1->lock);
@@ -83,7 +83,7 @@ static inline void double_timer_base_unlock(struct evl_timerbase *tb1,
 }
 
 /* timer base locked. */
-static void program_timer(struct evl_timer *timer,
+static void program_timer(struct evl_timer *timer, /* 将定时器的下一次到期时间编程到对应运行队列。 */
 			struct evl_timerbase *base)
 {
 	struct evl_rq *rq = evl_get_timer_rq(timer);
@@ -96,7 +96,7 @@ static void program_timer(struct evl_timer *timer,
 		evl_program_local_tick(timer->clock);
 }
 
-void evl_start_timer(struct evl_timer *timer,
+void evl_start_timer(struct evl_timer *timer, /* 启动定时器并设置其到期时间、周期和运行状态。 */
 		ktime_t value, ktime_t interval)
 {
 	struct evl_timerbase *base;
@@ -148,7 +148,7 @@ void evl_start_timer(struct evl_timer *timer,
 EXPORT_SYMBOL_GPL(evl_start_timer);
 
 /* timer base locked. */
-bool evl_timer_deactivate(struct evl_timer *timer)
+bool evl_timer_deactivate(struct evl_timer *timer) /* 停用定时器并将其从定时器队列中移除。 */
 {
 	struct evl_tqueue *tq = &timer->base->q;
 	bool heading = true;
@@ -164,7 +164,7 @@ bool evl_timer_deactivate(struct evl_timer *timer)
 }
 
 /* timerbase locked, hard irqs off */
-static void stop_timer_locked(struct evl_timer *timer)
+static void stop_timer_locked(struct evl_timer *timer) /* 在已持有定时器基锁时停止定时器。 */
 {
 	bool heading;
 
@@ -183,7 +183,7 @@ static void stop_timer_locked(struct evl_timer *timer)
 	}
 }
 
-void __evl_stop_timer(struct evl_timer *timer)
+void __evl_stop_timer(struct evl_timer *timer) /* 停止定时器并安全处理其所在运行队列。 */
 {
 	struct evl_timerbase *base;
 	unsigned long flags;
@@ -195,7 +195,7 @@ void __evl_stop_timer(struct evl_timer *timer)
 }
 EXPORT_SYMBOL_GPL(__evl_stop_timer);
 
-ktime_t evl_get_timer_date(struct evl_timer *timer)
+ktime_t evl_get_timer_date(struct evl_timer *timer) /* 获取定时器当前的绝对到期时间。 */
 {
 	struct evl_timerbase *base;
 	unsigned long flags;
@@ -214,7 +214,7 @@ ktime_t evl_get_timer_date(struct evl_timer *timer)
 }
 EXPORT_SYMBOL_GPL(evl_get_timer_date);
 
-ktime_t __evl_get_timer_delta(struct evl_timer *timer)
+ktime_t __evl_get_timer_delta(struct evl_timer *timer) /* 计算定时器距离下一次到期的相对时间。 */
 {
 	struct evl_timerbase *base;
 	ktime_t expiry, now;
@@ -233,7 +233,7 @@ EXPORT_SYMBOL_GPL(__evl_get_timer_delta);
 
 #ifdef CONFIG_SMP
 
-static inline int get_clock_cpu(struct evl_clock *clock, int cpu)
+static inline int get_clock_cpu(struct evl_clock *clock, int cpu) /* 根据时钟亲和性为定时器选择运行 CPU。 */
 {
 	/*
 	 * Check a CPU number against the possible set of CPUs
@@ -258,14 +258,14 @@ static inline int get_clock_cpu(struct evl_clock *clock, int cpu)
 
 #else
 
-static inline int get_clock_cpu(struct evl_clock *clock, int cpu)
+static inline int get_clock_cpu(struct evl_clock *clock, int cpu) /* 在单处理器模式下直接返回唯一的运行 CPU。 */
 {
 	return 0;
 }
 
 #endif /* CONFIG_SMP */
 
-void __evl_init_timer(struct evl_timer *timer,
+void __evl_init_timer(struct evl_timer *timer, /* 初始化定时器并关联时钟、处理函数和运行队列。有队列时优先用其 CPU，必要时回退到时钟支持的 CPU；无队列时用首个允许 EVL 线程运行的 CPU。 */
 		struct evl_clock *clock,
 		void (*handler)(struct evl_timer *timer),
 		struct evl_rq *rq,
@@ -297,7 +297,7 @@ void __evl_init_timer(struct evl_timer *timer,
 }
 EXPORT_SYMBOL_GPL(__evl_init_timer);
 
-void evl_set_timer_gravity(struct evl_timer *timer, int gravity)
+void evl_set_timer_gravity(struct evl_timer *timer, int gravity) /* 设置定时器的时钟重力值。 */
 {
 	struct evl_timerbase *base;
 	unsigned long flags;
@@ -310,7 +310,7 @@ void evl_set_timer_gravity(struct evl_timer *timer, int gravity)
 }
 EXPORT_SYMBOL_GPL(evl_set_timer_gravity);
 
-void evl_destroy_timer(struct evl_timer *timer)
+void evl_destroy_timer(struct evl_timer *timer) /* 销毁定时器并释放其关联资源。 */
 {
 	evl_stop_timer(timer);
 	timer->status |= EVL_TIMER_KILLED;
@@ -330,7 +330,7 @@ EXPORT_SYMBOL_GPL(evl_destroy_timer);
  *
  * hard irqs off on entry.
  */
-void evl_move_timer(struct evl_timer *timer,
+void evl_move_timer(struct evl_timer *timer, /* 将定时器迁移到新的运行队列或时钟。 */
 		struct evl_clock *clock, struct evl_rq *rq)
 {
 	struct evl_timerbase *old_base, *new_base;
@@ -385,7 +385,7 @@ void evl_move_timer(struct evl_timer *timer,
 }
 EXPORT_SYMBOL_GPL(evl_move_timer);
 
-unsigned long evl_get_timer_overruns(struct evl_timer *timer)
+unsigned long evl_get_timer_overruns(struct evl_timer *timer) /* 获取定时器已经发生的超时次数。 */
 {
 	unsigned long overruns = 0, flags;
 	struct evl_timerbase *base;
@@ -474,13 +474,13 @@ EXPORT_SYMBOL_GPL(evl_get_timer_overruns);
 #ifdef CONFIG_EVL_TIMER_SCALABLE
 
 static __always_inline
-bool date_is_earlier(struct evl_tnode *left,
+bool date_is_earlier(struct evl_tnode *left, /* 比较两个定时器节点的到期日期。 */
 		struct evl_tnode *right)
 {
 	return left->date < right->date;
 }
 
-void evl_insert_tnode(struct evl_tqueue *tq, struct evl_tnode *node)
+void evl_insert_tnode(struct evl_tqueue *tq, struct evl_tnode *node) /* 将定时器节点按到期日期顺序插入定时器队列。 */
 {
 	struct rb_node **new = &tq->root.rb_node, *parent = NULL;
 	struct evl_tnode *i;

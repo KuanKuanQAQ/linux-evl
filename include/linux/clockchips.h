@@ -246,7 +246,7 @@ static inline void tick_setup_hrtimer_broadcast(void) { }
 struct clock_proxy_device {
 	struct clock_event_device proxy_device;
 	struct clock_event_device *real_device;
-	void (*handle_oob_event)(struct clock_event_device *dev);
+	void (*handle_oob_event)(struct clock_event_device *dev); /* 接管时用作真实设备的 OOB event_handler。 */
 	void (*__setup_handler)(struct clock_proxy_device *dev);
 	void (*__original_handler)(struct clock_event_device *dev);
 };

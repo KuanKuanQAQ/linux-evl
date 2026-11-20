@@ -57,6 +57,8 @@ void evl_add_state_chain(struct notifier_block *nb);
 
 void evl_remove_state_chain(struct notifier_block *nb);
 
+int evl_stop_services(void);
+
 int __evl_activate_oob_mm(struct oob_mm_state *p);
 
 static inline int evl_activate_oob_mm(void)
